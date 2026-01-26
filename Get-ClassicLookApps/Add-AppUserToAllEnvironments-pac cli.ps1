@@ -66,6 +66,10 @@ if (-not $SkipPacInstallCheck) {
 Write-Host "Authenticating to Power Platform..." -ForegroundColor Cyan
 pac auth create 
 
+# Register application as Power Platform administrator
+Write-Host "Registering application $ClientId as Power Platform administrator..." -ForegroundColor Cyan
+pac admin application register --application-id $ClientId
+
 # Get all environments as JSON and parse to objects
 Write-Host "Retrieving environments..." -ForegroundColor Cyan
 $environmentsJson = pac env list --json | ConvertFrom-Json
