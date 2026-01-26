@@ -29,8 +29,9 @@ By default, Global Administrators and Power Platform Administrators do **not** h
 
 ### Instructions
 
-1. Import and run the Power Automate flow: `ApplySystemAdministratorRoletoAllEnvironmentsforCurrentUser_20260114193333.zip`
-2. This flow must be run by a **Global Admin** or **Power Platform Admin**
+1. Import the Power Automate flow package (not a solution): `ApplySystemAdministratorRoletoAllEnvironmentsforCurrentUser_20260114193333.zip`
+   - Go to [Power Automate](https://make.powerautomate.com) > **My flows** > **Import** > **Import Package (Legacy)**
+2. Run the flow - it must be run by a **Global Admin** or **Power Platform Admin**
 3. The flow will grant the System Administrator role to the specified user account in every Power Platform environment
 
 > **Note:** You can use either a regular user account or a service account (which is technically a user account). MFA can be enabled on this account.
