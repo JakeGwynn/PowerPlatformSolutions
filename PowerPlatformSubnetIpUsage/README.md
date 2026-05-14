@@ -4,6 +4,8 @@ PowerShell script that reports IP-address utilization for the Azure subnet you h
 
 When you enable Power Platform VNet support, every Power Platform container that runs against the policy consumes one IP from the delegated subnet. There is no native Maker/Admin Portal report for "how many IPs are still available", so this script fills the gap.
 
+> **Just need the raw count?** A trimmed-down companion, [`Get-SubnetUsedIpCount.ps1`](Get-SubnetUsedIpCount.ps1), takes the same `-ResourceGroupName / -VirtualNetworkName / -SubnetName` parameters and returns a single integer — useful for quick CLI checks or embedding in other scripts.
+
 ## What it does
 
 - Enumerates the IP configurations attached to the delegated subnet.
