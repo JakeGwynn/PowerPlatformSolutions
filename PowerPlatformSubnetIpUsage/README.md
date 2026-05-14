@@ -293,7 +293,11 @@ See [Example 7](#7-run-as-a-scheduled-snapshot-and-write-to-dataverse).
 
 ### 5. Customizing field names
 
-If your table uses a different prefix or different column names, pass `-DataverseFieldMap` with only the keys you want to override. Any key you omit still uses the default; any key you set to `$null` is **skipped** during the write.
+There are two ways to change the column logical names the script writes to:
+
+#### Option A — pass `-DataverseFieldMap` per invocation (no script changes)
+
+Best when you only need to override a few columns or when different environments use different schemas. Any key you omit still uses the in-script default; any key you set to `$null` is **skipped** during the write.
 
 ```powershell
 $map = @{
@@ -306,6 +310,32 @@ $map = @{
 
 .\Get-PowerPlatformSubnetIpUsage.ps1 ... -DataverseFieldMap $map
 ```
+
+#### Option B — edit the in-script default map (permanent change)
+
+Best when your whole organization uses a single non-`jg_` prefix and you do not want to pass `-DataverseFieldMap` every time. Open `Get-PowerPlatformSubnetIpUsage.ps1`, find the `$defaultMap` hashtable inside the `if ($DataverseUrl)` block (search for `$defaultMap = @{`), and edit the values on the right-hand side. The keys on the left **must not change** — they are the script's internal property names — only the values (your Dataverse column logical names) should be edited.
+
+```powershell
+# Before
+$defaultMap = @{
+    Timestamp              = 'jg_timestamp'
+    Subscription           = 'jg_subscriptionname'
+    ...
+    Method                 = 'jg_method'
+}
+
+# After (Contoso prefix)
+$defaultMap = @{
+    Timestamp              = 'contoso_timestamp'
+    Subscription           = 'contoso_subscriptionname'
+    ...
+    Method                 = 'contoso_method'
+}
+```
+
+You can also remove rows from the map entirely if your table does not have those columns — the script skips any key whose Dataverse column is not present.
+
+If you change the table's logical name as well, also update the `-DataverseTableSetName` value you pass at the command line (or set a default for the parameter at the top of the script).
 
 ## Suggested historical-tracking patterns
 
