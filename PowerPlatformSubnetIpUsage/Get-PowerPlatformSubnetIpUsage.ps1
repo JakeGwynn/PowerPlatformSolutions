@@ -133,6 +133,172 @@ function Test-Module {
     }
 }
 
+function ConvertTo-PlainSecret {
+    param([Parameter(Mandatory)][object]$Secret)
+    if ($Secret -is [securestring]) {
+        $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Secret)
+        try { [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
+        finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+    } else {
+        [string]$Secret
+    }
+}
+
+function Get-SubnetIpConfiguration {
+    <#
+    .SYNOPSIS
+        Returns the active IP configurations for a subnet using either Az.Network or Resource Graph.
+    .OUTPUTS
+        [pscustomobject] with NicName, IpAddress, Source. IpAddress is $null for Az unless -IncludeIpAddress.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][ValidateSet('Az','Graph')] [string]$Method,
+        [Parameter(Mandatory)] $Subnet,
+        [Parameter(Mandatory)] [string]$ResourceGroupName,
+        [Parameter(Mandatory)] [string]$SubscriptionId,
+        [switch]$IncludeIpAddress
+    )
+
+    switch ($Method) {
+        'Az' {
+            $items = foreach ($ipc in $Subnet.IpConfigurations) {
+                # ipc.Id looks like .../networkInterfaces/<nic>/ipConfigurations/<name>
+                $nicName = ($ipc.Id -split '/networkInterfaces/')[1].Split('/')[0]
+                [pscustomobject]@{ NicName = $nicName; IpAddress = $null; Source = 'Az' }
+            }
+
+            if (-not $IncludeIpAddress -or -not $items) { return $items }
+
+            # Resolve the actual private IPs by reading each NIC
+            $nicNames = $items.NicName | Select-Object -Unique
+            $nics = foreach ($n in $nicNames) {
+                try { Get-AzNetworkInterface -ResourceGroupName $ResourceGroupName -Name $n -ErrorAction Stop }
+                catch { Write-Verbose "Could not read NIC $n - $($_.Exception.Message)"; $null }
+            }
+            return @(
+                foreach ($nic in $nics | Where-Object { $_ }) {
+                    foreach ($cfg in $nic.IpConfigurations) {
+                        if ($cfg.Subnet.Id -eq $Subnet.Id) {
+                            [pscustomobject]@{
+                                NicName   = $nic.Name
+                                IpAddress = $cfg.PrivateIpAddress
+                                Source    = 'Az'
+                            }
+                        }
+                    }
+                }
+            )
+        }
+
+        'Graph' {
+            Test-Module -Name 'Az.ResourceGraph'
+            $targetSubnetId = $Subnet.Id
+            $kql = @"
+resources
+| where type == 'microsoft.network/networkinterfaces'
+| mv-expand ipConfig = properties.ipConfigurations
+| where tolower(tostring(ipConfig.properties.subnet.id)) == tolower('$targetSubnetId')
+| project nicName = name, ipAddress = tostring(ipConfig.properties.privateIPAddress)
+"@
+            $rows = Search-AzGraph -Query $kql -Subscription $SubscriptionId -First 1000
+            return @(
+                foreach ($r in $rows) {
+                    [pscustomobject]@{ NicName = $r.nicName; IpAddress = $r.ipAddress; Source = 'Graph' }
+                }
+            )
+        }
+    }
+}
+
+function Write-DataverseSnapshot {
+    <#
+    .SYNOPSIS
+        POSTs a snapshot object to a Dataverse table using OAuth2 client_credentials.
+    .OUTPUTS
+        [pscustomobject] with TableSetName, RecordId, StatusCode, Url.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$DataverseUrl,
+        [Parameter(Mandatory)][string]$TableSetName,
+        [Parameter(Mandatory)][string]$TenantId,
+        [Parameter(Mandatory)][string]$ClientId,
+        [Parameter(Mandatory)][object]$ClientSecret,
+        [Parameter(Mandatory)] $Snapshot,
+        [Parameter(Mandatory)][hashtable]$FieldMap
+    )
+
+    $dvBase   = $DataverseUrl.TrimEnd('/')
+    $secret   = ConvertTo-PlainSecret -Secret $ClientSecret
+    $tokenUrl = "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token"
+
+    Write-Verbose "Acquiring Dataverse OAuth token from $tokenUrl"
+    try {
+        $tokenResp = Invoke-WebRequest -Uri $tokenUrl -Method POST -UseBasicParsing -ErrorAction Stop `
+            -ContentType 'application/x-www-form-urlencoded' -Body @{
+                client_id     = $ClientId
+                client_secret = $secret
+                scope         = "$dvBase/.default"
+                grant_type    = 'client_credentials'
+            }
+        $token = ($tokenResp.Content | ConvertFrom-Json).access_token
+    } catch {
+        throw "Failed to acquire Dataverse token: $($_.Exception.Message)"
+    }
+
+    # Build payload using only the mapped fields that exist on the snapshot
+    $payload = [ordered]@{}
+    foreach ($key in $FieldMap.Keys) {
+        if ($null -ne $FieldMap[$key] -and $null -ne $Snapshot.PSObject.Properties[$key]) {
+            $payload[$FieldMap[$key]] = $Snapshot.$key
+        }
+    }
+    # Provide a sensible primary-name value if the map includes it
+    if ($FieldMap.ContainsKey('Name') -and $FieldMap['Name']) {
+        $payload[$FieldMap['Name']] = "$($Snapshot.Subnet) @ $($Snapshot.Timestamp)"
+    }
+
+    $createUri = "$dvBase/api/data/v9.2/$TableSetName"
+    $headers = @{
+        Authorization      = "Bearer $token"
+        'OData-Version'    = '4.0'
+        'OData-MaxVersion' = '4.0'
+        Accept             = 'application/json'
+        Prefer             = 'return=representation'
+    }
+    $json = $payload | ConvertTo-Json -Depth 5
+
+    Write-Verbose "POST $createUri"
+    Write-Verbose $json
+    try {
+        $resp = Invoke-WebRequest -Uri $createUri -Method POST -Headers $headers `
+            -Body $json -ContentType 'application/json; charset=utf-8' -UseBasicParsing -ErrorAction Stop
+        $created = $resp.Content | ConvertFrom-Json
+        $recordId = $created."$($TableSetName.TrimEnd('s'))id"
+        if (-not $recordId) {
+            $loc = $resp.Headers['OData-EntityId']
+            if ($loc -and $loc -match '\(([0-9a-fA-F-]{36})\)') { $recordId = $matches[1] }
+        }
+        return [pscustomobject]@{
+            TableSetName = $TableSetName
+            RecordId     = $recordId
+            StatusCode   = [int]$resp.StatusCode
+            Url          = $createUri
+        }
+    } catch {
+        $errBody = $null
+        if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $errBody = $_.ErrorDetails.Message }
+        elseif ($_.Exception.Response) {
+            try {
+                $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+                $errBody = $reader.ReadToEnd()
+            } catch {}
+        }
+        throw "Dataverse write failed: $($_.Exception.Message)`nResponse: $errBody"
+    }
+}
+
 # Ensure context
 Test-Module -Name 'Az.Accounts'
 $ctx = Get-AzContext
@@ -170,59 +336,9 @@ $delegations = @($subnet.Delegations | ForEach-Object { $_.ServiceName })
 $isPpDelegated = $delegations -contains 'Microsoft.PowerPlatform/enterprisePolicies'
 
 # Collect used IPs
-$ipDetails = @()
-
-switch ($Method) {
-    'Az' {
-        foreach ($ipc in $subnet.IpConfigurations) {
-            # ipc.Id looks like .../networkInterfaces/<nic>/ipConfigurations/<name>
-            $nicName = ($ipc.Id -split '/networkInterfaces/')[1].Split('/')[0]
-            $ipDetails += [pscustomobject]@{
-                NicName   = $nicName
-                IpAddress = $null   # Not populated in subnet child object; resolve below if requested
-                Source    = 'Az'
-            }
-        }
-
-        if ($ShowIpDetails -and $ipDetails.Count -gt 0) {
-            $nicNames = $ipDetails.NicName | Select-Object -Unique
-            $nics = foreach ($n in $nicNames) {
-                try { Get-AzNetworkInterface -ResourceGroupName $ResourceGroupName -Name $n -ErrorAction Stop } catch { $null }
-            }
-            $ipDetails = foreach ($nic in $nics | Where-Object { $_ }) {
-                foreach ($cfg in $nic.IpConfigurations) {
-                    if ($cfg.Subnet.Id -eq $subnet.Id) {
-                        [pscustomobject]@{
-                            NicName   = $nic.Name
-                            IpAddress = $cfg.PrivateIpAddress
-                            Source    = 'Az'
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    'Graph' {
-        Test-Module -Name 'Az.ResourceGraph'
-        $targetSubnetId = $subnet.Id
-        $kql = @"
-resources
-| where type == 'microsoft.network/networkinterfaces'
-| mv-expand ipConfig = properties.ipConfigurations
-| where tolower(tostring(ipConfig.properties.subnet.id)) == tolower('$targetSubnetId')
-| project nicName = name, ipAddress = tostring(ipConfig.properties.privateIPAddress)
-"@
-        $rows = Search-AzGraph -Query $kql -Subscription $ctx.Subscription.Id -First 1000
-        $ipDetails = foreach ($r in $rows) {
-            [pscustomobject]@{
-                NicName   = $r.nicName
-                IpAddress = $r.ipAddress
-                Source    = 'Graph'
-            }
-        }
-    }
-}
+$ipDetails = @(Get-SubnetIpConfiguration -Method $Method -Subnet $subnet `
+    -ResourceGroupName $ResourceGroupName -SubscriptionId $ctx.Subscription.Id `
+    -IncludeIpAddress:$ShowIpDetails)
 
 $usedIps     = $ipDetails.Count
 $reservedIps = 5  # Azure reserves 5 IPs in every subnet
@@ -297,82 +413,16 @@ if ($DataverseUrl) {
     }
     $fieldMap = if ($DataverseFieldMap) { $DataverseFieldMap } else { $defaultMap }
 
-    # Normalize secret to plain string for the OAuth call
-    $plainSecret = if ($DataverseClientSecret -is [securestring]) {
-        $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($DataverseClientSecret)
-        try { [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
-        finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
-    } else { [string]$DataverseClientSecret }
+    $dataverseResult = Write-DataverseSnapshot `
+        -DataverseUrl  $DataverseUrl `
+        -TableSetName  $DataverseTableSetName `
+        -TenantId      $DataverseTenantId `
+        -ClientId      $DataverseClientId `
+        -ClientSecret  $DataverseClientSecret `
+        -Snapshot      $summary `
+        -FieldMap      $fieldMap
 
-    $dvBase = $DataverseUrl.TrimEnd('/')
-    $tokenUrl = "https://login.microsoftonline.com/$DataverseTenantId/oauth2/v2.0/token"
-    $scope = "$dvBase/.default"
-
-    Write-Verbose "Acquiring Dataverse OAuth token from $tokenUrl"
-    $tokenBody = @{
-        client_id     = $DataverseClientId
-        client_secret = $plainSecret
-        scope         = $scope
-        grant_type    = 'client_credentials'
-    }
-    try {
-        $tokenResp = Invoke-WebRequest -Uri $tokenUrl -Method POST -Body $tokenBody `
-            -ContentType 'application/x-www-form-urlencoded' -UseBasicParsing -ErrorAction Stop
-        $token = ($tokenResp.Content | ConvertFrom-Json).access_token
-    } catch {
-        throw "Failed to acquire Dataverse token: $($_.Exception.Message)"
-    }
-
-    # Build payload using only mapped fields the table actually has
-    $payload = [ordered]@{}
-    foreach ($key in $fieldMap.Keys) {
-        if ($null -ne $summary.PSObject.Properties[$key]) {
-            $val = $summary.$key
-            # Dataverse expects ISO-8601 strings for datetime; bools as bool; numbers as numbers
-            $payload[$fieldMap[$key]] = $val
-        }
-    }
-
-    $createUri = "$dvBase/api/data/v9.2/$DataverseTableSetName"
-    $headers = @{
-        Authorization    = "Bearer $token"
-        'OData-Version'  = '4.0'
-        'OData-MaxVersion' = '4.0'
-        Accept           = 'application/json'
-        Prefer           = 'return=representation'
-    }
-    $json = $payload | ConvertTo-Json -Depth 5
-
-    Write-Verbose "POST $createUri"
-    Write-Verbose $json
-    try {
-        $resp = Invoke-WebRequest -Uri $createUri -Method POST -Headers $headers `
-            -Body $json -ContentType 'application/json; charset=utf-8' -UseBasicParsing -ErrorAction Stop
-        $created = $resp.Content | ConvertFrom-Json
-        $recordId = $created."$(($DataverseTableSetName.TrimEnd('s')))id"
-        if (-not $recordId) {
-            # fall back to OData-EntityId header (e.g. https://.../jg_ipusagesnapshots(<guid>))
-            $loc = $resp.Headers['OData-EntityId']
-            if ($loc -and $loc -match '\(([0-9a-fA-F-]{36})\)') { $recordId = $matches[1] }
-        }
-        Write-Host "Wrote snapshot to Dataverse table '$DataverseTableSetName' (id: $recordId)" -ForegroundColor Green
-        $dataverseResult = [pscustomobject]@{
-            TableSetName = $DataverseTableSetName
-            RecordId     = $recordId
-            StatusCode   = [int]$resp.StatusCode
-            Url          = $createUri
-        }
-    } catch {
-        $errBody = $null
-        if ($_.ErrorDetails -and $_.ErrorDetails.Message) { $errBody = $_.ErrorDetails.Message }
-        elseif ($_.Exception.Response) {
-            try {
-                $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
-                $errBody = $reader.ReadToEnd()
-            } catch {}
-        }
-        throw "Dataverse write failed: $($_.Exception.Message)`nResponse: $errBody"
-    }
+    Write-Host "Wrote snapshot to Dataverse table '$DataverseTableSetName' (id: $($dataverseResult.RecordId))" -ForegroundColor Green
 }
 
 # Emit objects to the pipeline for downstream use (e.g., piping into Log Analytics)

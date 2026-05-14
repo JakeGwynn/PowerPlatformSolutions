@@ -16,22 +16,59 @@ When you enable Power Platform VNet support, every Power Platform container that
 
 ## Prerequisites
 
-- PowerShell 7+ (Windows PowerShell 5.1 also works).
-- Azure modules:
+### 1. PowerShell 7+ (recommended)
 
-  ```powershell
-  Install-Module Az.Accounts, Az.Network -Scope CurrentUser
-  # Optional, only needed if you use -Method Graph
-  Install-Module Az.ResourceGraph -Scope CurrentUser
-  ```
+The script targets PowerShell 7+, but Windows PowerShell 5.1 also works.
 
-- An authenticated Azure session with **Reader** on the subscription/VNet:
+Check your version:
 
-  ```powershell
-  Connect-AzAccount -TenantId <tenant-guid> -SubscriptionId <sub-guid>
-  ```
+```powershell
+$PSVersionTable.PSVersion
+```
 
-- (Optional, only if writing to Dataverse) An Entra app registration that has been added as an **Application User** in your Dataverse environment with create rights on the target table. See [Dataverse setup](#dataverse-setup-optional) below.
+Install PowerShell 7 if needed:
+
+```powershell
+winget install --id Microsoft.PowerShell
+```
+
+### 2. Azure PowerShell modules
+
+The script always needs `Az.Accounts` and `Az.Network`. `Az.ResourceGraph` is only needed if you use `-Method Graph`.
+
+```powershell
+Install-Module Az.Accounts, Az.Network -Scope CurrentUser -Force
+# Optional - only for -Method Graph
+Install-Module Az.ResourceGraph -Scope CurrentUser -Force
+```
+
+Verify they installed:
+
+```powershell
+Get-Module -ListAvailable Az.Accounts, Az.Network, Az.ResourceGraph |
+    Select-Object Name, Version
+```
+
+### 3. Authenticated Azure session
+
+The signed-in identity needs at minimum **Reader** on the resource group containing the VNet.
+
+```powershell
+Connect-AzAccount -TenantId <tenant-guid>
+Set-AzContext -SubscriptionId <subscription-guid>
+```
+
+If you do not have Reader yet, an Owner / User Access Administrator can grant it with:
+
+```powershell
+New-AzRoleAssignment -SignInName 'you@contoso.com' `
+    -RoleDefinitionName 'Reader' `
+    -ResourceGroupName 'rg-platform-network'
+```
+
+### 4. (Optional) Dataverse environment, app registration, table, and Application User
+
+You only need this if you want the historical-tracking write-back. See [Dataverse setup](#dataverse-setup-optional) below for the full walkthrough.
 
 ## Quick start
 
@@ -101,7 +138,7 @@ $result = .\Get-PowerPlatformSubnetIpUsage.ps1 `
   -SubnetName         'snet-powerplatform' `
   -ShowIpDetails
 
-$result.Details | Format-Table NicName, IpAddress, AllocationMethod, Owner
+$result.Details | Format-Table NicName, IpAddress, Source
 ```
 
 ### 3. Faster report across a large environment via Resource Graph
@@ -114,7 +151,63 @@ $result.Details | Format-Table NicName, IpAddress, AllocationMethod, Owner
   -Method Graph
 ```
 
-### 4. Run as a scheduled snapshot and write to Dataverse
+### 4. Run against an explicit subscription (no need to switch context first)
+
+```powershell
+.\Get-PowerPlatformSubnetIpUsage.ps1 `
+  -SubscriptionId     '00000000-0000-0000-0000-000000000000' `
+  -ResourceGroupName  'rg-platform-network' `
+  -VirtualNetworkName 'vnet-platform-eastus' `
+  -SubnetName         'snet-powerplatform'
+```
+
+### 5. Loop over every Power Platform delegated subnet in the subscription
+
+Useful when you have several VNets / regions and want a single report.
+
+```powershell
+$rows = Search-AzGraph -Query @"
+resources
+| where type == 'microsoft.network/virtualnetworks'
+| mv-expand subnet = properties.subnets
+| mv-expand delegation = subnet.properties.delegations
+| where tostring(delegation.properties.serviceName) == 'Microsoft.PowerPlatform/enterprisePolicies'
+| project rg = resourceGroup, vnet = name, subnet = tostring(subnet.name)
+"@
+
+$report = foreach ($r in $rows) {
+    (& .\Get-PowerPlatformSubnetIpUsage.ps1 `
+        -ResourceGroupName  $r.rg `
+        -VirtualNetworkName $r.vnet `
+        -SubnetName         $r.subnet `
+        -Method Graph).Summary
+}
+
+$report | Format-Table Subnet, TotalIpsInCidr, UsedIps, AvailableIps, UtilizationPercent
+$report | Export-Csv .\pp-subnet-usage.csv -NoTypeInformation
+```
+
+### 6. Alert when utilization crosses a threshold
+
+```powershell
+$threshold = 80
+$summary = (& .\Get-PowerPlatformSubnetIpUsage.ps1 `
+    -ResourceGroupName  'rg-platform-network' `
+    -VirtualNetworkName 'vnet-platform-eastus' `
+    -SubnetName         'snet-powerplatform').Summary
+
+if ($summary.UtilizationPercent -ge $threshold) {
+    Send-MailMessage -To 'platform-ops@contoso.com' `
+        -From 'azure-bot@contoso.com' `
+        -Subject "Power Platform subnet at $($summary.UtilizationPercent)%" `
+        -Body ($summary | Format-List | Out-String) `
+        -SmtpServer 'smtp.contoso.com'
+}
+```
+
+### 7. Run as a scheduled snapshot and write to Dataverse
+
+Store your Dataverse client secret in an environment variable (or pull it from Key Vault) so it never appears on disk:
 
 ```powershell
 $secret = ConvertTo-SecureString $env:DV_CLIENT_SECRET -AsPlainText -Force
@@ -130,12 +223,28 @@ $secret = ConvertTo-SecureString $env:DV_CLIENT_SECRET -AsPlainText -Force
   -DataverseClientSecret $secret
 ```
 
-The cmdlet returns:
+The script returns:
 
 ```text
 Summary    : <pscustomobject with the aggregate snapshot>
 Details    : <per-NIC rows when -ShowIpDetails is set>
-Dataverse  : @{ Written = $true; RecordId = 'guid-of-new-row' }
+Dataverse  : @{ TableSetName; RecordId; StatusCode; Url }
+```
+
+### 8. Pull the Dataverse secret from Azure Key Vault
+
+```powershell
+$secret = (Get-AzKeyVaultSecret -VaultName 'kv-platform' -Name 'dv-clientsecret').SecretValue
+
+.\Get-PowerPlatformSubnetIpUsage.ps1 `
+  -ResourceGroupName     'rg-platform-network' `
+  -VirtualNetworkName    'vnet-platform-eastus' `
+  -SubnetName            'snet-powerplatform' `
+  -DataverseUrl          'https://orgxxxxxxxx.crm.dynamics.com' `
+  -DataverseTableSetName 'jg_ipusagesnapshots' `
+  -DataverseTenantId     '00000000-0000-0000-0000-000000000000' `
+  -DataverseClientId     '11111111-1111-1111-1111-111111111111' `
+  -DataverseClientSecret $secret
 ```
 
 ## Dataverse setup (optional)
@@ -156,7 +265,7 @@ Recommended columns (logical names match the script's default `DataverseFieldMap
 
 | Display name | Logical name | Type | Notes |
 |---|---|---|---|
-| Name | `jg_name` | Text (200) | Primary name column. The script writes the snapshot timestamp here. |
+| Name | `jg_name` | Text (200) | Primary name column. |
 | Timestamp | `jg_timestamp` | Date & Time | UTC timestamp of the snapshot. |
 | Subscription | `jg_subscriptionname` | Text (200) | |
 | Subscription Id | `jg_subscriptionid` | Text (200) | |
@@ -180,7 +289,7 @@ Recommended columns (logical names match the script's default `DataverseFieldMap
 
 ### 4. Run the script with the Dataverse parameters
 
-See [Example 4](#4-run-as-a-scheduled-snapshot-and-write-to-dataverse).
+See [Example 7](#7-run-as-a-scheduled-snapshot-and-write-to-dataverse).
 
 ### 5. Customizing field names
 
