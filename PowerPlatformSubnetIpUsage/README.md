@@ -4,7 +4,76 @@ PowerShell script that reports IP-address utilization for the Azure subnet you h
 
 When you enable Power Platform VNet support, every Power Platform container that runs against the policy consumes one IP from the delegated subnet. There is no native Maker/Admin Portal report for "how many IPs are still available", so this script fills the gap.
 
-> **Just need the raw count?** A trimmed-down companion, [`Get-SubnetUsedIpCount.ps1`](Get-SubnetUsedIpCount.ps1), takes the same `-ResourceGroupName / -VirtualNetworkName / -SubnetName` parameters and returns a single integer — useful for quick CLI checks or embedding in other scripts.
+This folder contains two scripts:
+
+| Script | Use when you want to… |
+|---|---|
+| [`Get-PowerPlatformSubnetIpUsage.ps1`](Get-PowerPlatformSubnetIpUsage.ps1) | Get the **full report** — totals, delegation check, per-NIC details, optional Dataverse write-back for historical tracking. |
+| [`Get-SubnetUsedIpCount.ps1`](Get-SubnetUsedIpCount.ps1) | Get a **quick used-vs-available summary** for a single subnet. No Dataverse, no delegation check, no module beyond `Az.Network`. |
+
+Jump to: [Full report script](#full-report-get-powerplatformsubnetipusageps1) · [Simple script](#simple-script-get-subnetusedipcountps1) · [Prerequisites](#prerequisites) · [Examples](#examples) · [Dataverse setup](#dataverse-setup-optional)
+
+## Simple script (`Get-SubnetUsedIpCount.ps1`)
+
+A trimmed-down companion when you only need to know "how full is this subnet right now?". Works against any Azure subnet (not just Power Platform delegated ones).
+
+### Usage
+
+```powershell
+.\Get-SubnetUsedIpCount.ps1 `
+  -ResourceGroupName  'rg-platform-network' `
+  -VirtualNetworkName 'vnet-platform-eastus' `
+  -SubnetName         'snet-powerplatform'
+```
+
+Sample console output (color-coded — green / yellow / red based on utilization):
+
+```text
+  +--------------------------------------------------------+
+  | Subnet IP usage: snet-powerplatform (10.50.0.32/27)    |
+  +--------------------------------------------------------+
+  | Used        : 12                                       |
+  | Available   : 15 of 27 usable IPs                      |
+  | Utilization : 44.44%                                   |
+  +--------------------------------------------------------+
+```
+
+It also returns a `[pscustomobject]` so you can pipe / consume it:
+
+```text
+Subnet             : snet-powerplatform
+AddressPrefixes    : 10.50.0.32/27
+UsedIps            : 12
+AvailableIps       : 15
+TotalUsableIps     : 27
+UtilizationPercent : 44.44
+```
+
+### Parameters
+
+| Parameter | Required | Description |
+|---|---|---|
+| `SubscriptionId` | No | Azure subscription containing the VNet. Uses current `Get-AzContext` if omitted. |
+| `ResourceGroupName` | **Yes** | Resource group of the virtual network. |
+| `VirtualNetworkName` | **Yes** | Name of the VNet. |
+| `SubnetName` | **Yes** | Name of the subnet. |
+| `Quiet` | No | Switch. Suppresses the boxed console output; only emits the result object. |
+
+### Quiet mode example
+
+```powershell
+$r = .\Get-SubnetUsedIpCount.ps1 `
+  -ResourceGroupName  'rg-platform-network' `
+  -VirtualNetworkName 'vnet-platform-eastus' `
+  -SubnetName         'snet-powerplatform' `
+  -Quiet
+
+if ($r.AvailableIps -lt 5) { Write-Warning "Almost out of IPs!" }
+```
+
+Prerequisites are a subset of the full script's: **PowerShell 5.1+**, **`Az.Network` only** (no `Az.ResourceGraph` needed), and **Reader on the VNet's resource group**. See [Prerequisites](#prerequisites) below for install commands.
+
+## Full report (`Get-PowerPlatformSubnetIpUsage.ps1`)
 
 ## What it does
 
