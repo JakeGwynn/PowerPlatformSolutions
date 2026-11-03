@@ -1,5 +1,9 @@
 # PowerPlatformSolutions
 
+- [Developer premium app inventory](DeveloperPremiumAppInventory/README.md): read-only,
+  tenant-wide PowerShell inventory of premium-capability apps in unmanaged Developer
+  environments, with resumable paging, throttling protection, and explicit coverage/review reports.
+
 
 Copyright 2025 Jake Gwynn
 

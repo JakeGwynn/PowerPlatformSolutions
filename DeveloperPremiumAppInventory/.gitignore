@@ -1,0 +1,14 @@
+reports/
+.test-output/
+*.pending
+.sources/
+.merge/
+.inventory.lock
+checkpoint.json
+RunSummary.json
+AllApps.csv
+PremiumApps.csv
+ReviewApps.csv
+Environments.csv
+Coverage.csv
+Failures.csv
