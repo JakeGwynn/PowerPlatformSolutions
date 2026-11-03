@@ -1,11 +1,12 @@
-#Requires -Version 7.4
+#Requires -Version 5.1
 [CmdletBinding()]
 param(
     [switch]$SkipScale,
     [ValidateRange(100000, 1000000)][int]$ScaleApps = 100000,
     [string]$OutputDirectory = (Join-Path $PSScriptRoot '..\.test-output'),
     [switch]$KeepOutput,
-    [ValidateSet('', 'Create', 'Resume')][string]$ProcessProbe = ''
+    [ValidateSet('', 'Create', 'Resume')][string]$ProcessProbe = '',
+    [string]$OtherPowerShellPath
 )
 
 Set-StrictMode -Version Latest
@@ -14,6 +15,9 @@ Import-Module (Join-Path $PSScriptRoot '..\Inventory.psm1') -Force
 $module = Get-Module Inventory
 $testRoot = Join-Path ([System.IO.Path]::GetFullPath($OutputDirectory)) ([guid]::NewGuid().ToString())
 [System.IO.Directory]::CreateDirectory($testRoot) | Out-Null
+$testDataRoot = Join-Path ([System.IO.Path]::GetTempPath()) ('ppi-' + [guid]::NewGuid().ToString('N').Substring(0, 12))
+if ([System.IO.Directory]::Exists($testDataRoot)) { throw 'The temporary test data directory already exists.' }
+[System.IO.Directory]::CreateDirectory($testDataRoot) | Out-Null
 $results = [System.Collections.Generic.List[object]]::new()
 $tenant = '11111111-1111-4111-8111-111111111111'
 $timer = [System.Diagnostics.Stopwatch]::StartNew()
@@ -165,7 +169,7 @@ function New-Fixture {
         AppOnly = $false; Now = [DateTimeOffset]::Parse('2026-11-03T15:00:00Z')
         Apps = $Apps; EnvironmentCount = $Environments; PageSize = $PageSize
         Rounds = $(if ($Apps -gt 0) { [int]($Apps / ($Environments * 10)) } else { 0 })
-        Output = Join-Path $testRoot ([guid]::NewGuid().ToString())
+        Output = Join-Path $testDataRoot ([guid]::NewGuid().ToString())
         UnknownEnvironment = -1; MissingUrlEnvironment = -1
         Calls = @{}; TokenCalls = @{}; Sleeps = [System.Collections.Generic.List[double]]::new()
         Actions = [System.Collections.Generic.Queue[object]]::new(); Transform = $null
@@ -342,6 +346,7 @@ if ($ProcessProbe) {
         Assert-Equal $summary.ReportedApps 80 'Cross-process resume count'
         Assert-ReportIds $f
     }
+    [IO.Directory]::Delete($testDataRoot, $true)
     exit 0
 }
 
@@ -353,12 +358,68 @@ Invoke-Test 'Public command exposes its synopsis, parameters, and runnable help 
     Assert-True ($help.Synopsis -match 'unmanaged Developer') 'Missing public synopsis'
     Assert-Equal @($help.Examples).Count 2 'Missing runnable invocation/resume examples'
     foreach ($example in (Get-Help $scriptPath -Full).examples.example) {
-        Assert-True ($example.code -match '^pwsh -File ') 'PowerShell help truncated the invocation example'
+        Assert-True ($example.code -match '^(powershell\.exe|pwsh) -File ') 'PowerShell help truncated the invocation example'
     }
 }
 
+Invoke-Test 'Portable JSON preserves nested arrays, nulls, booleans, and literal Unicode escapes' {
+    $json = '{"empty":[],"one":[{"nested":[false,null]}],"stamp":"2026-01-01T00:00:00Z","text":"\u0027<tag>&\u0027","literal":"\\u0027","slashes":"\\\\\u0027"}'
+    $value = & $module { param($Json) ConvertFrom-InventoryJson $Json } $json
+    Assert-True ($value -is [Collections.IDictionary]) 'JSON objects must be dictionaries'
+    Assert-Equal $value.empty.Count 0 'Empty JSON array was lost'
+    Assert-Equal $value.one.Count 1 'Singleton JSON array was flattened'
+    Assert-Equal $value.one[0].nested.Count 2 'Nested JSON array was lost'
+    Assert-Equal $value.one[0].nested[0] $false 'JSON boolean was changed'
+    Assert-True ($null -eq $value.one[0].nested[1]) 'JSON null was changed'
+    Assert-Equal $value.literal '\u0027' 'Literal escape text was decoded twice'
+    $roundTrip = & $module {
+        param($Value)
+        ConvertFrom-InventoryJson (ConvertTo-InventoryJson $Value)
+    } $value
+    Assert-Equal $roundTrip.literal $value.literal 'JSON serialization changed literal escape text'
+    Assert-Equal $roundTrip.slashes $value.slashes 'Escaped backslashes changed during serialization'
+    Assert-Equal $roundTrip.text $value.text 'HTML/single-quote escape normalization changed text'
+    $expectedCanonical = '{"empty":[],"text":"single ''quote'' <tag> & double \"quote\""}'
+    $digests = & $module {
+        param($Expected)
+        @{
+            Expected = Get-Sha256 $Expected
+            Actual = Get-ObjectDigest @{ text = 'single ''quote'' <tag> & double "quote"'; empty = @() }
+        }
+    } $expectedCanonical
+    Assert-Equal $digests.Actual $digests.Expected 'Canonical source hashes differ from the existing PowerShell 7 encoding'
+}
+
+Invoke-Test 'Portable hashing and atomic replacement preserve committed files' {
+    $path = Join-Path $testRoot 'atomic-compatibility.txt'
+    $values = & $module {
+        param($Path)
+        Write-AtomicText $Path 'abc'
+        $first = Get-FileDigest $Path
+        Write-AtomicText $Path 'replacement'
+        @{ First = $first; Empty = Get-Sha256 ''; Actual = [IO.File]::ReadAllText($Path) }
+    } $path
+    Assert-Equal $values.First 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad' 'SHA-256 file hash changed'
+    Assert-Equal $values.Empty 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855' 'Empty text hash changed'
+    Assert-Equal $values.Actual 'replacement' 'Existing atomic file was not replaced'
+    Assert-True (-not [IO.File]::Exists("$path.pending")) 'Atomic replacement left an uncommitted temporary file'
+}
+
+Invoke-Test 'The bounded portable merge retains identical lines from different input files' {
+    $directory = Join-Path $testRoot 'merge-compatibility'
+    [IO.Directory]::CreateDirectory($directory) | Out-Null
+    $first = Join-Path $directory 'first.txt'
+    $second = Join-Path $directory 'second.txt'
+    $output = Join-Path $directory 'merged.txt'
+    [IO.File]::WriteAllLines($first, [string[]]@('a', 'b', 'c'))
+    [IO.File]::WriteAllLines($second, [string[]]@('a', 'b', 'd'))
+    & $module { param($Paths, $Output) Merge-RunFiles $Paths $Output } ([string[]]@($first, $second)) $output
+    Assert-Equal ([IO.File]::ReadAllLines($output) -join ',') 'a,a,b,b,c,d' 'Portable merge dropped duplicate lines or changed ordering'
+}
+
 Invoke-Test 'Actual HTTP transport reads content and enforces a response-body timeout' {
-    Add-Type -TypeDefinition @'
+    $compilerArguments = @{
+        TypeDefinition = @'
 using System;
 using System.IO;
 using System.Net;
@@ -370,9 +431,10 @@ using System.Threading.Tasks;
 public sealed class InventoryTestHandler : HttpMessageHandler
 {
     public bool Slow;
+    public bool IgnoreCancellation;
     protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken token)
     {
-        Stream stream = Slow ? (Stream)new InventorySlowStream() :
+        Stream stream = Slow ? (Stream)new InventorySlowStream(IgnoreCancellation) :
             new MemoryStream(Encoding.UTF8.GetBytes("{\"value\":[]}"));
         return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StreamContent(stream) });
     }
@@ -380,23 +442,30 @@ public sealed class InventoryTestHandler : HttpMessageHandler
 
 public sealed class InventorySlowStream : Stream
 {
-    public override bool CanRead => true;
-    public override bool CanSeek => false;
-    public override bool CanWrite => false;
-    public override long Length => 0;
-    public override long Position { get => 0; set => throw new NotSupportedException(); }
-    public override int Read(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    private readonly bool ignoreCancellation;
+    public InventorySlowStream(bool ignoreCancellation) { this.ignoreCancellation = ignoreCancellation; }
+    public override bool CanRead { get { return true; } }
+    public override bool CanSeek { get { return false; } }
+    public override bool CanWrite { get { return false; } }
+    public override long Length { get { return 0; } }
+    public override long Position { get { return 0; } set { throw new NotSupportedException(); } }
+    public override int Read(byte[] buffer, int offset, int count) { throw new NotSupportedException(); }
     public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken token)
     {
-        await Task.Delay(5000, token);
+        await Task.Delay(5000, ignoreCancellation ? CancellationToken.None : token);
         return 0;
     }
     public override void Flush() { }
-    public override long Seek(long offset, SeekOrigin origin) => throw new NotSupportedException();
-    public override void SetLength(long value) => throw new NotSupportedException();
-    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+    public override long Seek(long offset, SeekOrigin origin) { throw new NotSupportedException(); }
+    public override void SetLength(long value) { throw new NotSupportedException(); }
+    public override void Write(byte[] buffer, int offset, int count) { throw new NotSupportedException(); }
 }
 '@
+    }
+    if ($PSVersionTable.PSEdition -eq 'Desktop') {
+        $compilerArguments.ReferencedAssemblies = @('System.dll', 'System.Core.dll', 'System.Net.Http.dll')
+    }
+    Add-Type @compilerArguments
     $handler = [InventoryTestHandler]::new()
     $client = [Net.Http.HttpClient]::new($handler)
     try {
@@ -410,17 +479,20 @@ public sealed class InventorySlowStream : Stream
         Assert-Equal $response.StatusCode 200 'HTTP transport status'
         Assert-Equal $response.Body '{"value":[]}' 'HTTP response content'
         $handler.Slow = $true
-        $watch = [Diagnostics.Stopwatch]::StartNew()
-        Assert-Throws {
-            & $module {
-                param($Client)
-                Invoke-HttpTransport @{ HttpClient = $Client; RequestTimeoutSeconds = 1 } @{
-                    Method = 'GET'; Uri = 'https://api.powerplatform.com/offline-test'
-                    Headers = @{}; Body = $null
-                }
-            } $client
-        } 'canceled|cancelled'
-        Assert-True ($watch.Elapsed.TotalSeconds -lt 3) 'Response body bypassed the request deadline'
+        foreach ($ignoreCancellation in @($false, $true)) {
+            $handler.IgnoreCancellation = $ignoreCancellation
+            $watch = [Diagnostics.Stopwatch]::StartNew()
+            Assert-Throws {
+                & $module {
+                    param($Client)
+                    Invoke-HttpTransport @{ HttpClient = $Client; RequestTimeoutSeconds = 1 } @{
+                        Method = 'GET'; Uri = 'https://api.powerplatform.com/offline-test'
+                        Headers = @{}; Body = $null
+                    }
+                } $client
+            } 'canceled|cancelled'
+            Assert-True ($watch.Elapsed.TotalSeconds -lt 3) 'Response body bypassed the request deadline'
+        }
     }
     finally { $client.Dispose() }
 }
@@ -793,7 +865,7 @@ Invoke-Test 'Resume rejects tenant/page-size mismatch, changed reports, and corr
             }
             'cursor' {
                 $path = [IO.Directory]::EnumerateFiles((Join-Path $f.Output '.sources'), 'state.json', [IO.SearchOption]::AllDirectories) | Select-Object -First 1
-                $state = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable
+                $state = & $module { param($Path) Read-JsonFile $Path } $path
                 $state.Cursor = 'corrupt'
                 [IO.File]::WriteAllText($path, (ConvertTo-Json -InputObject $state -Depth 40 -Compress))
             }
@@ -823,12 +895,27 @@ Invoke-Test 'Interrupted page commit resumes without duplicates or skipped IDs' 
 }
 
 Invoke-Test 'Source fingerprints and resume work across separate PowerShell processes' {
-    $probeRoot = Join-Path $testRoot 'cross-process'
+    $probeRoot = Join-Path $testDataRoot 'cross-process'
     $executable = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
     & $executable -NoLogo -NoProfile -File $PSCommandPath -ProcessProbe Create -OutputDirectory $probeRoot
     Assert-Equal $LASTEXITCODE 0 'Cross-process initial checkpoint'
     & $executable -NoLogo -NoProfile -File $PSCommandPath -ProcessProbe Resume -OutputDirectory $probeRoot
     Assert-Equal $LASTEXITCODE 0 'Cross-process resume failed'
+}
+
+if ($OtherPowerShellPath) {
+    Invoke-Test 'Inventory checkpoints resume in both directions between Windows PowerShell and PowerShell 7' {
+        $current = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        foreach ($direction in @('CurrentToOther', 'OtherToCurrent')) {
+            $probeRoot = Join-Path $testDataRoot $direction
+            $createEngine = if ($direction -eq 'CurrentToOther') { $current } else { $OtherPowerShellPath }
+            $resumeEngine = if ($direction -eq 'CurrentToOther') { $OtherPowerShellPath } else { $current }
+            & $createEngine -NoLogo -NoProfile -File $PSCommandPath -ProcessProbe Create -OutputDirectory $probeRoot
+            Assert-Equal $LASTEXITCODE 0 'Initial cross-engine checkpoint failed'
+            & $resumeEngine -NoLogo -NoProfile -File $PSCommandPath -ProcessProbe Resume -OutputDirectory $probeRoot
+            Assert-Equal $LASTEXITCODE 0 'Cross-engine resume changed hashes or lost app IDs'
+        }
+    }
 }
 
 Invoke-Test 'Resume retries only incomplete sources and never persists tokens' {
@@ -865,6 +952,7 @@ if (-not $SkipScale) {
         Assert-Equal $s.IncompleteSources 0 'Scale source failures'
         Assert-ReportIds $f
         $scaleEvidence = @{
+            PowerShellVersion = $PSVersionTable.PSVersion.ToString(); PSEdition = $PSVersionTable.PSEdition
             SyntheticApps = $ScaleApps; Environments = 250
             ReportedApps = $s.ReportedApps; PremiumApps = $s.PremiumApps; ReviewApps = $s.ReviewApps
             IncompleteSources = $s.IncompleteSources; Calls = $f.Calls
@@ -877,14 +965,17 @@ if (-not $SkipScale) {
 
 $failed = @($results | Where-Object { -not $_.Passed }).Count
 $evidence = @{
+    PowerShellVersion = $PSVersionTable.PSVersion.ToString(); PSEdition = $PSVersionTable.PSEdition
     Passed = $results.Count - $failed; Failed = $failed
     Seconds = $timer.Elapsed.TotalSeconds; ScaleSkipped = [bool]$SkipScale
     LiveTenantTested = $false; Tests = $results.ToArray()
+    TestDataDirectory = $testDataRoot
 }
 [IO.File]::WriteAllText((Join-Path $testRoot 'test-results.json'), (ConvertTo-Json -InputObject $evidence -Depth 10))
 Write-Host "$($evidence.Passed) passed, $failed failed; $([Math]::Round($timer.Elapsed.TotalSeconds, 2)) seconds"
 Write-Host "Evidence: $testRoot"
 if (-not $KeepOutput -and $failed -eq 0) {
+    [IO.Directory]::Delete($testDataRoot, $true)
     foreach ($path in [IO.Directory]::EnumerateDirectories($testRoot)) {
         [IO.Directory]::Delete($path, $true)
     }

@@ -30,12 +30,21 @@ inventory. It never uses an app's or solution's `ismanaged` flag to choose envir
 
 ## Prerequisites and permissions
 
-- **PowerShell 7.4 or newer**, on Windows, Linux, or macOS; Windows PowerShell 5.1 is
-  not supported. The offline validation was run with PowerShell **7.6.9 on Windows**.
+- **Windows PowerShell 5.1** (`powershell.exe`) with **.NET Framework 4.7.2 or newer**,
+  or **PowerShell 7.4 or newer** (`pwsh`) on Windows, Linux, or macOS.
+  Windows PowerShell 5.0 and earlier are not supported.
 - **Az.Accounts 4.0 or newer** for interactive delegated user authentication:
 
   ```powershell
   Install-Module Az.Accounts -MinimumVersion 4.0 -Scope CurrentUser -Repository PSGallery
+  ```
+
+  Install it from the engine you will use; Windows PowerShell and PowerShell 7
+  have different user module directories. If an older Windows PowerShell session
+  cannot reach PSGallery, enable TLS 1.2 for that session before installation:
+
+  ```powershell
+  [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
   ```
 
 - Your own **Microsoft Entra tenant GUID** and user account. No tenant, account,
@@ -60,6 +69,9 @@ inventory. It never uses an app's or solution's `ismanaged` flag to choose envir
   journal. Avoid network/synchronized folders without reliable exclusive locks and
   atomic same-directory rename semantics. Output includes owner information;
   protect it using your organization's access and retention policies.
+  Windows PowerShell retains .NET Framework's legacy path-length restrictions;
+  use a short output path such as `C:\Reports\DeveloperApps` so hashed journal
+  subdirectories and filenames also fit within those limits.
 
 The script requires a supported full-visibility role in the token's `wids` claim.
 If that claim is absent, it stops rather than guessing that a restricted user has
@@ -79,12 +91,16 @@ Clone/download the solution folder **including `Inventory.psm1`**. From the
 repository root, replace the tenant GUID and use a new, empty output directory:
 
 ```powershell
-pwsh -NoLogo -NoProfile -File .\DeveloperPremiumAppInventory\Get-UnmanagedDeveloperPremiumApps.ps1 `
+powershell.exe -NoLogo -NoProfile -File .\DeveloperPremiumAppInventory\Get-UnmanagedDeveloperPremiumApps.ps1 `
     -TenantId '<your-tenant-guid>' `
     -OutputDirectory 'C:\Reports\DeveloperApps'
 
 $LASTEXITCODE
 ```
+
+For PowerShell 7, replace `powershell.exe` with `pwsh`. No script changes are
+needed between engines. Existing checkpoints remain compatible, including
+resuming with the other engine on the same machine and output path.
 
 By default, the script signs you in with `Connect-AzAccount -Tenant ...`, pins that
 context, disables context autosave for this process only, and obtains/refreshes
@@ -218,7 +234,9 @@ capture a resource created and deleted between observations.
   Permanent 4xx/501/505 are not blindly retried; 401 permits one token refresh.
 - **Timeouts:** default 120 seconds per attempt, including the response body;
   responses larger than 64 MiB fail explicitly. Reduce page size for unusually
-  large app metadata.
+  large app metadata. The deadline is enforced even when a .NET Framework stream
+  does not honor mid-read cancellation. Windows PowerShell uses TLS 1.2 for API
+  requests; PowerShell 7 keeps the operating system's protocol selection.
 - **Paging safeguards:** missing/truncated continuations, repeated/cyclic
   tokens, repeated content pages, unordered/duplicate Inventory resource IDs,
   mismatched counts/tenant IDs, and unsafe continuation destinations fail
@@ -236,7 +254,7 @@ capture a resource created and deleted between observations.
 Resume with the **same tenant, output path, and page size**:
 
 ```powershell
-pwsh -NoLogo -NoProfile -File .\DeveloperPremiumAppInventory\Get-UnmanagedDeveloperPremiumApps.ps1 `
+powershell.exe -NoLogo -NoProfile -File .\DeveloperPremiumAppInventory\Get-UnmanagedDeveloperPremiumApps.ps1 `
     -TenantId '<your-tenant-guid>' `
     -OutputDirectory 'C:\Reports\DeveloperApps' `
     -Resume `
@@ -263,8 +281,13 @@ opaque paging cursors, but never access/refresh tokens or credentials.
 No Pester or other test dependency is required, and no tenant sign-in occurs:
 
 ```powershell
+powershell.exe -NoLogo -NoProfile -File .\DeveloperPremiumAppInventory\tests\Invoke-Tests.ps1
 pwsh -NoLogo -NoProfile -File .\DeveloperPremiumAppInventory\tests\Invoke-Tests.ps1
 ```
+
+Verified on **Windows PowerShell 5.1.26100.9711 (.NET Framework 4.8)** and
+**PowerShell 7.6.9**: **45 checks passed on each engine**, including the
+100,000-app exercise and checkpoint resume in both directions between engines.
 
 The default test run generates **100,000 synthetic apps across 250 environments**,
 using paged JSON responses for Inventory, Admin Apps, environment detail, and
@@ -274,11 +297,24 @@ positive premium apps, and **16,000** review apps; the other environments are
 managed or non-Developer. The smaller tests cover empty inventories, all known
 app kinds, unknown metadata, denied access, tenant/role isolation, throttling
 headers, retry limits, token refresh, response-body deadlines, bad paging,
-corruption, exclusive locks, and separate-process resume.
+corruption, exclusive locks, and separate-process resume. JSON conversion,
+SHA-256 hashing, atomic replacement, and the bounded merge use APIs compatible
+with .NET Framework as well as modern .NET. Test evidence records the engine
+version and edition.
+
+To also exercise checkpoint resume in both directions between the installed
+engines, pass the other executable explicitly:
+
+```powershell
+powershell.exe -NoLogo -NoProfile -File .\DeveloperPremiumAppInventory\tests\Invoke-Tests.ps1 `
+    -OtherPowerShellPath (Get-Command pwsh).Source
+```
 
 Use `-SkipScale` for a smaller development run. `-OutputDirectory` places synthetic
-test artifacts elsewhere; `test-results.json` and `scale-evidence.json` retain
+test evidence elsewhere; `test-results.json` and `scale-evidence.json` retain
 the assertions/results, and `-KeepOutput` retains generated test inventories.
+Inventories use a separate short, unique temporary directory so deeply nested
+repository/session paths do not exceed Windows PowerShell's path limits.
 Default generated test output and the solution's `reports` folder are Git-ignored.
 
 **Synthetic/offline scale validation is not a live 100,000-app tenant test.**

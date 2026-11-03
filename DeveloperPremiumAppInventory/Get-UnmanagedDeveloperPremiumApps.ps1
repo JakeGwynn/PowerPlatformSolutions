@@ -1,4 +1,4 @@
-#Requires -Version 7.4
+#Requires -Version 5.1
 
 <#
 .SYNOPSIS
@@ -40,7 +40,7 @@ rather than being shortened. Default 900 seconds.
 Timeout for each HTTP attempt, including reading its response body. Default 120.
 
 .EXAMPLE
-pwsh -File .\Get-UnmanagedDeveloperPremiumApps.ps1 -TenantId 'YOUR-TENANT-GUID' -OutputDirectory 'C:\Reports\DeveloperApps'
+powershell.exe -File .\Get-UnmanagedDeveloperPremiumApps.ps1 -TenantId 'YOUR-TENANT-GUID' -OutputDirectory 'C:\Reports\DeveloperApps'
 
 .EXAMPLE
 pwsh -File .\Get-UnmanagedDeveloperPremiumApps.ps1 -TenantId 'YOUR-TENANT-GUID' -OutputDirectory 'C:\Reports\DeveloperApps' -Resume -UseExistingContext
@@ -49,6 +49,7 @@ pwsh -File .\Get-UnmanagedDeveloperPremiumApps.ps1 -TenantId 'YOUR-TENANT-GUID' 
 Exit codes: 0 = complete within documented scope, 1 = incomplete/failed,
 2 = discovery finished but classification, environment metadata, or source drift needs review.
 This script does not export apps, change permissions, or modify any tenant resource.
+Supported engines: Windows PowerShell 5.1 (.NET Framework 4.7.2+) and PowerShell 7.4+.
 #>
 [CmdletBinding()]
 param(

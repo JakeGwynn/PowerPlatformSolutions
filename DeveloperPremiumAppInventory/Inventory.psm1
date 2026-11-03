@@ -1,6 +1,7 @@
-#Requires -Version 7.4
+#Requires -Version 5.1
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Net.Http
 
 $script:ApiRoot = 'https://api.powerplatform.com'
 $script:ApiVersion = '2024-10-01'
@@ -23,9 +24,51 @@ function Get-Field {
 
 function Get-Sha256 {
     param([string]$Text)
-    return [Convert]::ToHexString(
-        [System.Security.Cryptography.SHA256]::HashData($script:Utf8.GetBytes($Text))
-    ).ToLowerInvariant()
+    $hash = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return [BitConverter]::ToString($hash.ComputeHash($script:Utf8.GetBytes($Text))).Replace('-', '').ToLowerInvariant()
+    }
+    finally { $hash.Dispose() }
+}
+
+function ConvertFrom-JsonValue {
+    param($Value)
+    if ($Value -is [System.Management.Automation.PSCustomObject]) {
+        $result = [ordered]@{}
+        foreach ($property in $Value.PSObject.Properties) {
+            $result[$property.Name] = ConvertFrom-JsonValue $property.Value
+        }
+        return $result
+    }
+    if ($Value -is [System.Collections.IList]) {
+        $items = [object[]]::new($Value.Count)
+        for ($index = 0; $index -lt $items.Length; $index++) {
+            $items[$index] = ConvertFrom-JsonValue $Value[$index]
+        }
+        return ,$items
+    }
+    return $Value
+}
+
+function ConvertFrom-InventoryJson {
+    param([string]$Json, [int]$Depth = 100)
+    if ($PSVersionTable.PSVersion.Major -ge 6) {
+        return ConvertFrom-Json -InputObject $Json -AsHashtable -Depth $Depth
+    }
+    return ConvertFrom-JsonValue (ConvertFrom-Json -InputObject $Json)
+}
+
+function ConvertTo-InventoryJson {
+    param($Value, [int]$Depth = 40)
+    $json = ConvertTo-Json -InputObject $Value -Depth $Depth -Compress
+    if ($PSVersionTable.PSVersion.Major -le 5 -and $json.Contains('\u')) {
+        # Match only JSON escapes, not literal backslash-u text; retain existing PS7 checkpoint hashes.
+        $json = [regex]::Replace($json, '(?i)(?<!\\)((?:\\\\)*)\\u(0027|003c|003e|0026)', {
+            param($Match)
+            $Match.Groups[1].Value + [char][Convert]::ToInt32($Match.Groups[2].Value, 16)
+        })
+    }
+    return $json
 }
 
 function ConvertTo-CanonicalValue {
@@ -49,7 +92,7 @@ function ConvertTo-CanonicalValue {
 
 function Get-ObjectDigest {
     param($Value)
-    return Get-Sha256 (ConvertTo-Json -InputObject (ConvertTo-CanonicalValue $Value) -Depth 40 -Compress)
+    return Get-Sha256 (ConvertTo-InventoryJson (ConvertTo-CanonicalValue $Value))
 }
 
 function Get-TimestampString {
@@ -62,12 +105,19 @@ function Get-TimestampString {
 function Get-FileDigest {
     param([string]$Path)
     $stream = [System.IO.File]::OpenRead($Path)
+    $hash = [System.Security.Cryptography.SHA256]::Create()
     try {
-        return [Convert]::ToHexString(
-            [System.Security.Cryptography.SHA256]::HashData($stream)
-        ).ToLowerInvariant()
+        return [BitConverter]::ToString($hash.ComputeHash($stream)).Replace('-', '').ToLowerInvariant()
     }
-    finally { $stream.Dispose() }
+    finally { $hash.Dispose(); $stream.Dispose() }
+}
+
+function Complete-AtomicFile {
+    param([string]$Temporary, [string]$Path)
+    if ([System.IO.File]::Exists($Path)) {
+        [System.IO.File]::Replace($Temporary, $Path, [System.Management.Automation.Language.NullString]::Value)
+    }
+    else { [System.IO.File]::Move($Temporary, $Path) }
 }
 
 function Write-AtomicText {
@@ -79,21 +129,21 @@ function Write-AtomicText {
     )
     try {
         $bytes = $script:Utf8.GetBytes($Text)
-        $stream.Write($bytes)
+        $stream.Write($bytes, 0, $bytes.Length)
         $stream.Flush($true)
     }
     finally { $stream.Dispose() }
-    [System.IO.File]::Move($temporary, $Path, $true)
+    Complete-AtomicFile $temporary $Path
 }
 
 function Write-AtomicJson {
     param([string]$Path, $Value)
-    Write-AtomicText $Path (ConvertTo-Json -InputObject $Value -Depth 40 -Compress)
+    Write-AtomicText $Path (ConvertTo-InventoryJson $Value)
 }
 
 function Read-JsonFile {
     param([string]$Path)
-    return ConvertFrom-Json -InputObject ([System.IO.File]::ReadAllText($Path)) -AsHashtable -Depth 100
+    return ConvertFrom-InventoryJson ([System.IO.File]::ReadAllText($Path))
 }
 
 function New-InventoryError {
@@ -167,7 +217,7 @@ function Read-TokenClaims {
     $payload = $parts[1].Replace('-', '+').Replace('_', '/')
     $payload = $payload.PadRight($payload.Length + ((4 - $payload.Length % 4) % 4), '=')
     try {
-        return ConvertFrom-Json -AsHashtable -InputObject (
+        return ConvertFrom-InventoryJson (
             $script:Utf8.GetString([Convert]::FromBase64String($payload))
         )
     }
@@ -257,7 +307,7 @@ function Get-RetryDelayMilliseconds {
         if ([double]::TryParse([string](Get-Field $Headers $name),
                 [System.Globalization.NumberStyles]::Float,
                 [System.Globalization.CultureInfo]::InvariantCulture, [ref]$number) -and
-            [double]::IsFinite($number) -and $number -ge 0) {
+            -not [double]::IsNaN($number) -and -not [double]::IsInfinity($number) -and $number -ge 0) {
             $delay = [Math]::Max($delay, $number)
         }
     }
@@ -266,7 +316,7 @@ function Get-RetryDelayMilliseconds {
     $date = [DateTimeOffset]::MinValue
     if ([double]::TryParse($retryAfter, [System.Globalization.NumberStyles]::Float,
             [System.Globalization.CultureInfo]::InvariantCulture, [ref]$seconds) -and
-        [double]::IsFinite($seconds) -and $seconds -ge 0) {
+        -not [double]::IsNaN($seconds) -and -not [double]::IsInfinity($seconds) -and $seconds -ge 0) {
         $delay = [Math]::Max($delay, $seconds * 1000)
     }
     elseif ([DateTimeOffset]::TryParse($retryAfter, [System.Globalization.CultureInfo]::InvariantCulture,
@@ -277,11 +327,27 @@ function Get-RetryDelayMilliseconds {
     return [Math]::Min(60000, 1000 * [Math]::Pow(2, $Attempt)) + (Get-Random -Minimum 0 -Maximum 1001)
 }
 
+function Get-HttpTaskResult {
+    param(
+        [System.Threading.Tasks.Task]$Task,
+        [System.Threading.Tasks.Task]$Deadline,
+        [System.Threading.CancellationToken]$Token
+    )
+    $finished = [System.Threading.Tasks.Task]::WhenAny(
+        [System.Threading.Tasks.Task[]]@($Task, $Deadline)
+    ).GetAwaiter().GetResult()
+    if ([object]::ReferenceEquals($finished, $Deadline)) {
+        throw [System.OperationCanceledException]::new('HTTP request deadline exceeded; operation canceled.', $Token)
+    }
+    return $Task.GetAwaiter().GetResult()
+}
+
 function Invoke-HttpTransport {
     param($Session, $Request)
     $cancellation = [System.Threading.CancellationTokenSource]::new(
         [TimeSpan]::FromSeconds($Session.RequestTimeoutSeconds)
     )
+    $deadline = [System.Threading.Tasks.Task]::Delay(-1, $cancellation.Token)
     $message = [System.Net.Http.HttpRequestMessage]::new(
         [System.Net.Http.HttpMethod]::new($Request.Method), $Request.Uri
     )
@@ -291,23 +357,24 @@ function Invoke-HttpTransport {
         }
         if ($null -ne $Request.Body) {
             $message.Content = [System.Net.Http.StringContent]::new(
-                (ConvertTo-Json -InputObject $Request.Body -Depth 40 -Compress),
+                (ConvertTo-InventoryJson $Request.Body),
                 $script:Utf8, 'application/json'
             )
         }
-        $response = $Session.HttpClient.SendAsync(
+        $send = $Session.HttpClient.SendAsync(
             $message, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead, $cancellation.Token
-        ).GetAwaiter().GetResult()
+        )
+        $response = Get-HttpTaskResult $send $deadline $cancellation.Token
         try {
             $headers = @{}
             foreach ($header in $response.Headers) { $headers[$header.Key] = $header.Value -join ',' }
-            $content = $response.Content.ReadAsStream()
+            $content = Get-HttpTaskResult ($response.Content.ReadAsStreamAsync()) $deadline $cancellation.Token
             $buffer = [byte[]]::new(65536)
             $body = [System.IO.MemoryStream]::new()
             try {
-                while (($read = $content.ReadAsync(
+                while (($read = Get-HttpTaskResult ($content.ReadAsync(
                             $buffer, 0, $buffer.Length, $cancellation.Token
-                        ).GetAwaiter().GetResult()) -gt 0) {
+                        )) $deadline $cancellation.Token) -gt 0) {
                     if ($body.Length + $read -gt 64MB) {
                         throw (New-InventoryError 'API response exceeded the 64 MiB page safety limit. Use a smaller PageSize.')
                     }
@@ -320,7 +387,7 @@ function Invoke-HttpTransport {
         }
         finally { $response.Dispose() }
     }
-    finally { $message.Dispose(); $cancellation.Dispose() }
+    finally { $message.Dispose(); $cancellation.Cancel(); $cancellation.Dispose() }
 }
 
 function Invoke-InventoryRequest {
@@ -366,7 +433,7 @@ function Invoke-InventoryRequest {
         $Session.NotBefore = $now.AddMilliseconds($Session.RequestIntervalMilliseconds)
         if (-not $networkFailure -and $status -ge 200 -and $status -lt 300) {
             if ($response.Body -is [string]) {
-                try { return ConvertFrom-Json -InputObject $response.Body -AsHashtable -Depth 100 }
+                try { return ConvertFrom-InventoryJson $response.Body }
                 catch { throw (New-InventoryError "Invalid JSON response from $($Spec.Kind)." $status) }
             }
             return $response.Body
@@ -547,7 +614,7 @@ function Read-StagedRows {
             while ($null -ne ($line = $reader.ReadLine())) {
                 $separator = $line.IndexOf("`t")
                 if ($separator -lt 1) { throw (New-InventoryError 'Invalid staged record format.') }
-                ConvertFrom-Json -InputObject $line.Substring($separator + 1) -AsHashtable -Depth 40
+                ConvertFrom-InventoryJson $line.Substring($separator + 1) -Depth 40
             }
         }
         finally { $reader.Dispose() }
@@ -655,7 +722,7 @@ function Invoke-Source {
                     $lastId = $id
                 }
                 $record = ConvertTo-InventoryRecord $row $Spec $Session.TenantId
-                $lines.Add($record.Key + "`t" + (ConvertTo-Json -InputObject $record -Depth 20 -Compress))
+                $lines.Add($record.Key + "`t" + (ConvertTo-InventoryJson $record -Depth 20))
             }
             $lines.Sort([StringComparer]::Ordinal)
             $number = $state.PageCount + 1L
@@ -667,7 +734,7 @@ function Invoke-Source {
                 $writer.BaseStream.Flush($true)
             }
             finally { $writer.Dispose() }
-            [System.IO.File]::Move("$path.pending", $path, $true)
+            Complete-AtomicFile "$path.pending" $path
             $digest = Get-FileDigest $path
             $contentMarker = Join-Path $directory ('content-' + $digest)
             if ($data.Count -gt 0 -and [System.IO.File]::Exists($contentMarker) -and
@@ -715,20 +782,28 @@ function Invoke-Source {
 function Merge-RunFiles {
     param([string[]]$Paths, [string]$Destination)
     $readers = [System.Collections.Generic.List[System.IO.StreamReader]]::new()
-    $queue = [System.Collections.Generic.PriorityQueue[object,string]]::new([StringComparer]::Ordinal)
+    $queue = [System.Collections.Generic.SortedList[string,System.Collections.Generic.Queue[int]]]::new([StringComparer]::Ordinal)
     $writer = [System.IO.StreamWriter]::new($Destination, $false, $script:Utf8)
     try {
         for ($index = 0; $index -lt $Paths.Count; $index++) {
             $reader = [System.IO.StreamReader]::new($Paths[$index], $script:Utf8)
             $readers.Add($reader)
             $line = $reader.ReadLine()
-            if ($null -ne $line) { $queue.Enqueue(@{ Index = $index; Line = $line }, $line) }
+            if ($null -ne $line) {
+                if (-not $queue.ContainsKey($line)) { $queue.Add($line, [System.Collections.Generic.Queue[int]]::new()) }
+                $queue[$line].Enqueue($index)
+            }
         }
         while ($queue.Count -gt 0) {
-            $item = $queue.Dequeue()
-            $writer.WriteLine($item.Line)
-            $line = $readers[$item.Index].ReadLine()
-            if ($null -ne $line) { $queue.Enqueue(@{ Index = $item.Index; Line = $line }, $line) }
+            $line = $queue.Keys[0]
+            $index = $queue.Values[0].Dequeue()
+            if ($queue.Values[0].Count -eq 0) { $queue.RemoveAt(0) }
+            $writer.WriteLine($line)
+            $line = $readers[$index].ReadLine()
+            if ($null -ne $line) {
+                if (-not $queue.ContainsKey($line)) { $queue.Add($line, [System.Collections.Generic.Queue[int]]::new()) }
+                $queue[$line].Enqueue($index)
+            }
         }
     }
     finally {
@@ -934,7 +1009,7 @@ function Export-InventoryReports {
         try {
             while ($null -ne ($line = $reader.ReadLine())) {
                 $separator = $line.IndexOf("`t")
-                $record = ConvertFrom-Json -InputObject $line.Substring($separator + 1) -AsHashtable -Depth 40
+                $record = ConvertFrom-InventoryJson $line.Substring($separator + 1) -Depth 40
                 if ($record.RowKind -eq 'App') {
                     if ($null -eq $activeEnvironment -or
                         $activeEnvironment.EnvironmentId -ine $record.EnvironmentId) {
@@ -1011,7 +1086,7 @@ function Export-InventoryReports {
     finally { foreach ($writer in $writers.Values) { $writer.Dispose() } }
     foreach ($name in $writers.Keys) {
         $path = Join-Path $Session.Root $name
-        [System.IO.File]::Move("$path.pending", $path, $true)
+        Complete-AtomicFile "$path.pending" $path
         $summary.ReportHashes[$name] = Get-FileDigest $path
     }
     if ($summary.IncompleteSources -eq 0 -and -not $Session.Halt) {
@@ -1107,6 +1182,9 @@ function Invoke-DeveloperPremiumInventory {
         $handler = [System.Net.Http.HttpClientHandler]::new()
         $handler.AllowAutoRedirect = $false
         $handler.UseCookies = $false
+        if ($PSVersionTable.PSEdition -eq 'Desktop') {
+            $handler.SslProtocols = [System.Security.Authentication.SslProtocols]::Tls12
+        }
         $client = [System.Net.Http.HttpClient]::new($handler)
         $client.Timeout = [TimeSpan]::FromSeconds($RequestTimeoutSeconds)
         $session = @{
