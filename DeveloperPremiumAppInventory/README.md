@@ -30,16 +30,22 @@ inventory. It never uses an app's or solution's `ismanaged` flag to choose envir
 
 ## Prerequisites and permissions
 
-- **Windows PowerShell 5.1** (`powershell.exe`) with **.NET Framework 4.7.2 or newer**,
-  or **PowerShell 7.4 or newer** (`pwsh`) on Windows, Linux, or macOS.
-  Windows PowerShell 5.0 and earlier are not supported.
-- **Az.Accounts 4.0 or newer** for interactive delegated user authentication:
+- **Windows PowerShell 5.1** (`powershell.exe`) or **PowerShell 7.4 or newer** (`pwsh`).
+  Native client-secret mode only needs the runtime already required by the engine.
+  Native certificate mode needs the platform RSA-PSS certificate APIs and a
+  compatible RSA key provider (on Windows PowerShell, .NET Framework 4.6+ with a
+  CNG key). **Native modes do not require Az.Accounts or .NET Framework 4.7.2+.**
+  Windows PowerShell itself always runs on .NET Framework; this is not a claim
+  that it can run without its underlying runtime.
+- **Az.Accounts is optional**, used only by `-AuthenticationMode AzAccounts`
+  or an invocation without native credentials. That mode requires Az.Accounts
+  4.0+ and its supported runtime (.NET Framework 4.7.2+ on Windows PowerShell):
 
   ```powershell
   Install-Module Az.Accounts -MinimumVersion 4.0 -Scope CurrentUser -Repository PSGallery
   ```
 
-  Install it from the engine you will use; Windows PowerShell and PowerShell 7
+  If using AzAccounts, install it from the engine you will use; Windows PowerShell and PowerShell 7
   have different user module directories. If an older Windows PowerShell session
   cannot reach PSGallery, enable TLS 1.2 for that session before installation:
 
@@ -56,7 +62,8 @@ inventory. It never uses an app's or solution's `ismanaged` flag to choose envir
 - Delegated API access to `https://api.powerplatform.com`, including
   `ResourceQuery.Resources.Read`, `PowerApps.Apps.Read`, and
   `EnvironmentManagement.Environments.Read`, as permitted by the tenant and
-  [permission reference][permissions]. The Az delegated client must be permitted
+  [permission reference][permissions]. Your native application's delegated
+  permissions, or the Az delegated client, must be permitted
   by your tenant's consent and Conditional Access policies; an administrator may
   need to arrange consent outside this script. See [Microsoft's authentication
   instructions][authentication], including the Az.Accounts example.
@@ -75,36 +82,111 @@ inventory. It never uses an app's or solution's `ismanaged` flag to choose envir
 
 The script requires a supported full-visibility role in the token's `wids` claim.
 If that claim is absent, it stops rather than guessing that a restricted user has
-tenant-wide access. Activate the role, refresh the Az sign-in, and rerun.
+tenant-wide access. Activate the role, acquire a fresh user sign-in, and rerun.
 [Claim emission also depends on the resource application's configuration][claims]:
 if a fresh token still omits `wids`, this script cannot establish full visibility
 with that token configuration. It does not modify Microsoft applications, query
 Microsoft Graph, or create permissions to work around the check.
 
-**App-only/service-principal and managed-identity authentication are not supported
-by the Inventory API** and must not be used. No Azure subscription is required by
-the inventory; the default sign-in skips subscription context population.
+**Every mode remains delegated.** Client secrets and certificates authenticate
+your application during a user authorization-code flow; they do **not** make this
+an unattended app-only scan. Microsoft's Inventory API returns HTTP 403 for
+service-principal/client-credentials and managed-identity requests. The script
+never silently falls back to a canvas-only inventory. No Azure subscription is
+required.
 
 ## Run
 
-Clone/download the solution folder **including `Inventory.psm1`**. From the
-repository root, replace the tenant GUID and use a new, empty output directory:
+Clone/download the whole solution folder, including **`Inventory.psm1` and
+`Authentication.ps1`**. Use a new, empty private output directory.
+
+### Native client secret: no Az.Accounts
+
+In your own Microsoft Entra application registration, configure:
+
+- A **Web** redirect URI exactly matching `http://localhost:8400/` (or your
+  `-RedirectUri` value). Do not use a SPA or public mobile/desktop redirect type
+  for confidential client-secret/certificate authentication.
+- Delegated Power Platform API permissions listed above, and Dynamics CRM /
+  Dataverse `user_impersonation`, with appropriate administrator consent.
+- Your own client secret, or the public certificate corresponding to your private
+  key. Do not create/share credentials through this repository.
+
+The script does not create the registration, grant consent, change roles,
+import certificates into a store, or alter operating-system settings. The
+loopback listener is temporary, IPv4-only, and does not require an HTTP URL ACL or
+administrator elevation. The port must be free.
+
+From the repository root:
 
 ```powershell
 powershell.exe -NoLogo -NoProfile -File .\DeveloperPremiumAppInventory\Get-UnmanagedDeveloperPremiumApps.ps1 `
-    -TenantId '<your-tenant-guid>' `
+    -TenantId 'YOUR-TENANT-GUID' `
+    -ClientId 'YOUR-CLIENT-GUID' `
+    -AuthenticationMode ClientSecret `
     -OutputDirectory 'C:\Reports\DeveloperApps'
 
 $LASTEXITCODE
+```
+
+This prompts for the **application client secret** using `Read-Host -AsSecureString`,
+then opens Microsoft's browser sign-in for your user account. Your user password
+and MFA are handled by Microsoft, never entered into the script. Alternatively,
+from an existing PowerShell session:
+
+```powershell
+$secret = Read-Host 'Application client secret' -AsSecureString
+.\DeveloperPremiumAppInventory\Get-UnmanagedDeveloperPremiumApps.ps1 `
+    -TenantId 'YOUR-TENANT-GUID' -ClientId 'YOUR-CLIENT-GUID' `
+    -ClientSecret $secret -OutputDirectory 'C:\Reports\DeveloperApps'
+```
+
+Client IDs are public identifiers, not passwords. Secrets are accepted only as
+`SecureString` or via the secure prompt; do not put plaintext secrets in command
+lines, environment variables, source, transcripts, or configuration files.
+
+### Native certificate: no Az.Accounts
+
+Use an existing certificate with an accessible RSA-PSS-capable private key; its
+public certificate must already be registered on your own application:
+
+```powershell
+$certificate = Get-Item 'Cert:\CurrentUser\My\YOUR-CERTIFICATE-THUMBPRINT'
+.\DeveloperPremiumAppInventory\Get-UnmanagedDeveloperPremiumApps.ps1 `
+    -TenantId 'YOUR-TENANT-GUID' -ClientId 'YOUR-CLIENT-GUID' `
+    -ClientCertificate $certificate -OutputDirectory 'C:\Reports\DeveloperApps'
+```
+
+For a PFX file, obtain the object with `Get-PfxCertificate -FilePath ...`, using its
+secure password prompt, and pass it as `-ClientCertificate`. Do not export private
+keys. Certificate mode signs short-lived **PS256** assertions with a SHA-256
+certificate thumbprint, following [Microsoft's certificate credential contract][certificate-auth].
+Non-RSA, expired, inaccessible, or RSA-PSS-incompatible keys fail explicitly.
+
+Both native modes use [authorization code + PKCE][auth-code], cryptographically
+random callback state, and `form_post` so authorization codes aren't put in browser
+URL history. Tokens and refresh tokens stay in memory; refreshing is tenant- and
+audience-bound and cannot change user identity mid-scan. Login times out after
+600 seconds (`-LoginTimeoutSeconds`).
+
+### Optional Az.Accounts user sign-in
+
+```powershell
+powershell.exe -NoLogo -NoProfile -File .\DeveloperPremiumAppInventory\Get-UnmanagedDeveloperPremiumApps.ps1 `
+    -TenantId 'YOUR-TENANT-GUID' -AuthenticationMode AzAccounts `
+    -OutputDirectory 'C:\Reports\DeveloperApps'
 ```
 
 For PowerShell 7, replace `powershell.exe` with `pwsh`. No script changes are
 needed between engines. Existing checkpoints remain compatible, including
 resuming with the other engine on the same machine and output path.
 
-By default, the script signs you in with `Connect-AzAccount -Tenant ...`, pins that
-context, disables context autosave for this process only, and obtains/refreshes
-audience-specific user tokens. MFA and Conditional Access remain in effect.
+`Auto` selects `Certificate` when a certificate is supplied, `ClientSecret` when
+a client ID/secret is supplied, and otherwise `AzAccounts` for backward
+compatibility. Conflicting modes/credentials are rejected. AzAccounts signs you
+in with `Connect-AzAccount -Tenant ...`, pins that context, disables context
+autosave for this process only, and obtains/refreshes audience-specific user
+tokens. MFA and Conditional Access remain in effect in every mode.
 
 To supply an existing user context instead:
 
@@ -219,6 +301,8 @@ capture a resource created and deleted between observations.
   output; no tenant-wide app/environment dictionary or array is accumulated.
   At most eight audience tokens are cached. Disk use grows with inventory size;
   reserve several times the report size for journals and merge work files.
+  Growing collections use generic lists; fixed-size buffers/JSON page arrays stay
+  bounded. No array `+=` accumulation or per-app owner lookup is used.
 - **No per-app detail calls:** requests are tenant-wide Inventory pages plus
   bulk Admin Apps, environment detail, and two Dataverse collection scans per
   candidate environment. Owners/connectors are not fetched one app at a time.
@@ -234,9 +318,13 @@ capture a resource created and deleted between observations.
   Permanent 4xx/501/505 are not blindly retried; 401 permits one token refresh.
 - **Timeouts:** default 120 seconds per attempt, including the response body;
   responses larger than 64 MiB fail explicitly. Reduce page size for unusually
-  large app metadata. The deadline is enforced even when a .NET Framework stream
-  does not honor mid-read cancellation. Windows PowerShell uses TLS 1.2 for API
-  requests; PowerShell 7 keeps the operating system's protocol selection.
+  large app metadata. Networking uses native `Invoke-WebRequest` with
+  `-UseBasicParsing`, preventing HTML/script execution. One reused PowerShell
+  runspace bounds the entire download's time and size without launching a job or
+  process for every page. Inventory replies download to short-lived scratch files,
+  are checked before parsing, and are removed even on failure; OAuth replies are
+  memory-only. Windows PowerShell enables TLS 1.2 for the request and restores the
+  prior process setting; PowerShell 7 keeps its operating-system protocol selection.
 - **Paging safeguards:** missing/truncated continuations, repeated/cyclic
   tokens, repeated content pages, unordered/duplicate Inventory resource IDs,
   mismatched counts/tenant IDs, and unsafe continuation destinations fail
@@ -255,7 +343,8 @@ Resume with the **same tenant, output path, and page size**:
 
 ```powershell
 powershell.exe -NoLogo -NoProfile -File .\DeveloperPremiumAppInventory\Get-UnmanagedDeveloperPremiumApps.ps1 `
-    -TenantId '<your-tenant-guid>' `
+    -TenantId 'YOUR-TENANT-GUID' -ClientId 'YOUR-CLIENT-GUID' `
+    -AuthenticationMode ClientSecret `
     -OutputDirectory 'C:\Reports\DeveloperApps' `
     -Resume `
     -RequestIntervalMilliseconds 2000 `
@@ -267,6 +356,9 @@ Retry/pacing/timeout settings can change on resume. Completed sources are reused
 incomplete sources retry from their last committed cursor. Resolve permission or
 consent errors first. Journal/cursor checksums, source definitions, tenant/cloud/
 path/page-size binding, and report hashes are verified before resuming.
+Native modes perform a fresh user sign-in when restarting because refresh tokens
+are deliberately not saved. Authentication modes can change without changing
+inventory scope; the same tenant/output/page-size constraints still apply.
 
 Do not edit/move the journal or CSVs in place. Copy reports elsewhere for analysis.
 An expired server continuation token, corrupt/missing committed page, changed
@@ -286,8 +378,9 @@ pwsh -NoLogo -NoProfile -File .\DeveloperPremiumAppInventory\tests\Invoke-Tests.
 ```
 
 Verified on **Windows PowerShell 5.1.26100.9711 (.NET Framework 4.8)** and
-**PowerShell 7.6.9**: **45 checks passed on each engine**, including the
-100,000-app exercise and checkpoint resume in both directions between engines.
+**PowerShell 7.6.9**: **54 checks passed on each engine**, including native
+secret/certificate flows, native web cmdlets, and the 100,000-app native-secret
+inventory with interruption/resume. No live Microsoft tenant sign-in was performed.
 
 The default test run generates **100,000 synthetic apps across 250 environments**,
 using paged JSON responses for Inventory, Admin Apps, environment detail, and
@@ -297,7 +390,11 @@ positive premium apps, and **16,000** review apps; the other environments are
 managed or non-Developer. The smaller tests cover empty inventories, all known
 app kinds, unknown metadata, denied access, tenant/role isolation, throttling
 headers, retry limits, token refresh, response-body deadlines, bad paging,
-corruption, exclusive locks, and separate-process resume. JSON conversion,
+corruption, exclusive locks, and separate-process resume. Native-mode tests
+exercise secure secret encoding, certificate assertion signature verification,
+PKCE, the local form-post callback, token refresh, native HTTP status/backoff
+headers, a trickling response-body deadline, and no Az.Accounts import or token
+persistence. JSON conversion,
 SHA-256 hashing, atomic replacement, and the bounded merge use APIs compatible
 with .NET Framework as well as modern .NET. Test evidence records the engine
 version and edition.
@@ -351,3 +448,5 @@ does not run against the author's or the operator's tenant during tests.
 [code-apps]: https://learn.microsoft.com/en-us/power-apps/developer/code-apps/overview
 [licensing]: https://learn.microsoft.com/en-us/power-platform/admin/powerapps-flow-licensing-faq
 [claims]: https://learn.microsoft.com/en-us/entra/identity-platform/access-token-claims-reference
+[auth-code]: https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-auth-code-flow
+[certificate-auth]: https://learn.microsoft.com/en-us/entra/identity-platform/certificate-credentials

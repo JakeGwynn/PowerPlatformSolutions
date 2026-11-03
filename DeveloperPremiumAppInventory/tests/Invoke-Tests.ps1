@@ -306,6 +306,10 @@ function Invoke-Fixture {
         Transport = $Fixture.Transport; Sleep = $Fixture.Sleep; Clock = $Fixture.Clock
         FaultHook = $Fixture.FaultHook; Resume = $Resume; WarningAction = 'SilentlyContinue'
     }
+    if ($Fixture.ContainsKey('NativeOptions')) {
+        $arguments.Remove('TokenProvider')
+        foreach ($key in $Fixture.NativeOptions.Keys) { $arguments[$key] = $Fixture.NativeOptions[$key] }
+    }
     return Invoke-DeveloperPremiumInventory @arguments
 }
 
@@ -356,9 +360,10 @@ Invoke-Test 'Public command exposes its synopsis, parameters, and runnable help 
     $help = $ast.GetHelpContent()
     Assert-True ($null -ne $help) 'PowerShell did not recognize the comment-based help'
     Assert-True ($help.Synopsis -match 'unmanaged Developer') 'Missing public synopsis'
-    Assert-Equal @($help.Examples).Count 2 'Missing runnable invocation/resume examples'
+    Assert-Equal @($help.Examples).Count 3 'Missing secret/certificate/delegated invocation examples'
     foreach ($example in (Get-Help $scriptPath -Full).examples.example) {
-        Assert-True ($example.code -match '^(powershell\.exe|pwsh) -File ') 'PowerShell help truncated the invocation example'
+        $rendered = $example.code + ' ' + (@($example.remarks | ForEach-Object Text) -join ' ')
+        Assert-True ($rendered -match '(powershell\.exe|pwsh) -File |Get-UnmanagedDeveloperPremiumApps\.ps1') 'PowerShell help truncated the invocation example'
     }
 }
 
@@ -423,78 +428,410 @@ Invoke-Test 'Actual HTTP transport reads content and enforces a response-body ti
 using System;
 using System.IO;
 using System.Net;
-using System.Net.Http;
+using System.Net.Sockets;
+using System.Collections.Generic;
 using System.Text;
 using System.Threading;
-using System.Threading.Tasks;
 
-public sealed class InventoryTestHandler : HttpMessageHandler
+public sealed class NativeInventoryTestServer : IDisposable
 {
+    private readonly TcpListener listener;
+    private readonly Thread worker;
+    private TcpClient connection;
+    public string Uri { get; private set; }
     public bool Slow;
-    public bool IgnoreCancellation;
-    protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken token)
+    public int StatusCode = 200;
+    public string Body = "{\"value\":[]}";
+    public string RequestBody;
+    public readonly Dictionary<string, string> Headers = new Dictionary<string, string>();
+    public NativeInventoryTestServer()
     {
-        Stream stream = Slow ? (Stream)new InventorySlowStream(IgnoreCancellation) :
-            new MemoryStream(Encoding.UTF8.GetBytes("{\"value\":[]}"));
-        return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK) { Content = new StreamContent(stream) });
+        listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        Uri = "http://127.0.0.1:" + ((IPEndPoint)listener.LocalEndpoint).Port + "/";
+        worker = new Thread(Serve);
+        worker.IsBackground = true;
     }
-}
-
-public sealed class InventorySlowStream : Stream
-{
-    private readonly bool ignoreCancellation;
-    public InventorySlowStream(bool ignoreCancellation) { this.ignoreCancellation = ignoreCancellation; }
-    public override bool CanRead { get { return true; } }
-    public override bool CanSeek { get { return false; } }
-    public override bool CanWrite { get { return false; } }
-    public override long Length { get { return 0; } }
-    public override long Position { get { return 0; } set { throw new NotSupportedException(); } }
-    public override int Read(byte[] buffer, int offset, int count) { throw new NotSupportedException(); }
-    public override async Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken token)
+    public void Start() { worker.Start(); }
+    public static Thread PostAuthForm(string target, string form)
     {
-        await Task.Delay(5000, ignoreCancellation ? CancellationToken.None : token);
-        return 0;
+        Thread sender = new Thread(delegate()
+        {
+            System.Uri uri = new System.Uri(target);
+            using (TcpClient client = new TcpClient(uri.Host, uri.Port))
+            using (NetworkStream stream = client.GetStream())
+            {
+                byte[] body = Encoding.UTF8.GetBytes(form);
+                byte[] headers = Encoding.ASCII.GetBytes("POST " + uri.AbsolutePath +
+                    " HTTP/1.1\r\nHost: " + uri.Authority +
+                    "\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: " + body.Length +
+                    "\r\nConnection: close\r\n\r\n");
+                stream.Write(headers, 0, headers.Length);
+                stream.Write(body, 0, body.Length);
+                stream.ReadTimeout = 5000;
+                byte[] response = new byte[1024];
+                stream.Read(response, 0, response.Length);
+            }
+        });
+        sender.IsBackground = true;
+        sender.Start();
+        return sender;
     }
-    public override void Flush() { }
-    public override long Seek(long offset, SeekOrigin origin) { throw new NotSupportedException(); }
-    public override void SetLength(long value) { throw new NotSupportedException(); }
-    public override void Write(byte[] buffer, int offset, int count) { throw new NotSupportedException(); }
+    private void Serve()
+    {
+        try
+        {
+            connection = listener.AcceptTcpClient();
+            using (connection)
+            using (NetworkStream stream = connection.GetStream())
+            {
+                stream.ReadTimeout = 5000;
+                StreamReader reader = new StreamReader(stream, Encoding.UTF8, false, 1024, true);
+                string line = reader.ReadLine();
+                int length = 0;
+                while (!String.IsNullOrEmpty(line = reader.ReadLine()))
+                {
+                    if (line.StartsWith("Content-Length:", StringComparison.OrdinalIgnoreCase))
+                        length = Int32.Parse(line.Substring(15).Trim());
+                    if (line.StartsWith("Expect:", StringComparison.OrdinalIgnoreCase))
+                    {
+                        byte[] interim = Encoding.ASCII.GetBytes("HTTP/1.1 100 Continue\r\n\r\n");
+                        stream.Write(interim, 0, interim.Length);
+                    }
+                }
+                char[] request = new char[length];
+                int offset = 0;
+                while (offset < length)
+                {
+                    int read = reader.Read(request, offset, length - offset);
+                    if (read == 0) break;
+                    offset += read;
+                }
+                RequestBody = new String(request, 0, offset);
+                byte[] body = Encoding.UTF8.GetBytes(Body);
+                StringBuilder header = new StringBuilder("HTTP/1.1 " + StatusCode +
+                    " Result\r\nContent-Type: application/json; charset=utf-8\r\nConnection: close\r\nContent-Length: " + body.Length + "\r\n");
+                foreach (KeyValuePair<string, string> item in Headers)
+                    header.Append(item.Key + ": " + item.Value + "\r\n");
+                header.Append("\r\n");
+                byte[] headerBytes = Encoding.ASCII.GetBytes(header.ToString());
+                stream.Write(headerBytes, 0, headerBytes.Length);
+                if (Slow)
+                {
+                    for (int i = 0; i < body.Length; i++)
+                    {
+                        stream.Write(body, i, 1);
+                        stream.Flush();
+                        Thread.Sleep(400);
+                    }
+                }
+                else stream.Write(body, 0, body.Length);
+            }
+        }
+        catch (IOException) { }
+        catch (SocketException) { }
+        catch (ObjectDisposedException) { }
+    }
+    public void Dispose()
+    {
+        listener.Stop();
+        if (connection != null) connection.Close();
+        if (worker.IsAlive) worker.Join(2000);
+    }
 }
 '@
     }
     if ($PSVersionTable.PSEdition -eq 'Desktop') {
-        $compilerArguments.ReferencedAssemblies = @('System.dll', 'System.Core.dll', 'System.Net.Http.dll')
+        $compilerArguments.ReferencedAssemblies = @('System.dll', 'System.Core.dll')
     }
     Add-Type @compilerArguments
-    $handler = [InventoryTestHandler]::new()
-    $client = [Net.Http.HttpClient]::new($handler)
+    $server = [NativeInventoryTestServer]::new()
+    $server.Start()
+    $session = @{ RequestTimeoutSeconds = 5; NativeWebRunner = $null }
     try {
         $response = & $module {
-            param($Client)
-            Invoke-HttpTransport @{ HttpClient = $Client; RequestTimeoutSeconds = 1 } @{
-                Method = 'GET'; Uri = 'https://api.powerplatform.com/offline-test'
-                Headers = @{ Authorization = 'Bearer synthetic' }; Body = $null
+            param($Session, $Uri)
+            Invoke-HttpTransport $Session @{
+                Method = 'GET'; Uri = $Uri
+                Headers = @{ Accept = 'application/json' }; Body = $null
             }
-        } $client
+        } $session $server.Uri
         Assert-Equal $response.StatusCode 200 'HTTP transport status'
         Assert-Equal $response.Body '{"value":[]}' 'HTTP response content'
-        $handler.Slow = $true
-        foreach ($ignoreCancellation in @($false, $true)) {
-            $handler.IgnoreCancellation = $ignoreCancellation
-            $watch = [Diagnostics.Stopwatch]::StartNew()
-            Assert-Throws {
-                & $module {
-                    param($Client)
-                    Invoke-HttpTransport @{ HttpClient = $Client; RequestTimeoutSeconds = 1 } @{
-                        Method = 'GET'; Uri = 'https://api.powerplatform.com/offline-test'
-                        Headers = @{}; Body = $null
-                    }
-                } $client
-            } 'canceled|cancelled'
-            Assert-True ($watch.Elapsed.TotalSeconds -lt 3) 'Response body bypassed the request deadline'
+    }
+    finally { $server.Dispose(); if ($null -ne $session.NativeWebRunner) { $session.NativeWebRunner.Dispose() } }
+    $server = [NativeInventoryTestServer]::new()
+    $server.Slow = $true
+    $server.Start()
+    $session = @{ RequestTimeoutSeconds = 1; NativeWebRunner = $null }
+    try {
+        $watch = [Diagnostics.Stopwatch]::StartNew()
+        Assert-Throws {
+            & $module {
+                param($Session, $Uri)
+                Invoke-HttpTransport $Session @{ Method = 'GET'; Uri = $Uri; Headers = @{}; Body = $null }
+            } $session $server.Uri
+        } 'deadline|timed out|web request failed'
+        Assert-True ($watch.Elapsed.TotalSeconds -lt 3) 'Native response body bypassed the whole-request deadline'
+    }
+    finally { $server.Dispose(); if ($null -ne $session.NativeWebRunner) { $session.NativeWebRunner.Dispose() } }
+}
+
+Invoke-Test 'Native web cmdlets retain 429 headers and keep sensitive token responses off disk' {
+    $server = [NativeInventoryTestServer]::new()
+    $server.StatusCode = 429
+    $server.Headers.Add('Retry-After', '3')
+    $server.Start()
+    $session = @{ RequestTimeoutSeconds = 5; NativeWebRunner = $null }
+    try {
+        $response = & $module {
+            param($Session, $Uri)
+            Invoke-HttpTransport $Session @{ Method = 'GET'; Uri = $Uri; Headers = @{}; Body = $null }
+        } $session $server.Uri
+        Assert-Equal $response.StatusCode 429 'Native HTTP failure status was lost'
+        Assert-Equal $response.Headers['Retry-After'] '3' 'Native throttling header was lost'
+    }
+    finally { $server.Dispose(); if ($null -ne $session.NativeWebRunner) { $session.NativeWebRunner.Dispose() } }
+    $server = [NativeInventoryTestServer]::new()
+    $server.Body = '{"access_token":"synthetic-private-token"}'
+    $server.Start()
+    $session = @{ RequestTimeoutSeconds = 5; NativeWebRunner = $null }
+    try {
+        $response = & $module {
+            param($Session, $Uri)
+            Invoke-HttpTransport $Session @{
+                Method = 'POST'; Uri = $Uri; Headers = @{}
+                Body = 'client_secret=synthetic%26secret'; ContentType = 'application/x-www-form-urlencoded'; Sensitive = $true
+            }
+        } $session $server.Uri
+        Assert-Equal $response.Body $server.Body 'Sensitive response content was lost'
+        Assert-Equal $server.RequestBody 'client_secret=synthetic%26secret' 'Native form body encoding was changed'
+        Assert-Equal $session.NativeWebRunner.Commands.Commands.Count 0 'Native request parameters were left in the reusable runspace'
+        Assert-Equal $session.NativeWebRunner.Streams.Error.Count 0 'Raw native web errors were retained'
+    }
+    finally { $server.Dispose(); if ($null -ne $session.NativeWebRunner) { $session.NativeWebRunner.Dispose() } }
+}
+
+Invoke-Test 'Native loopback callback receives a form-post code without launching a real browser' {
+    $probe = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
+    $probe.Start()
+    $port = $probe.LocalEndpoint.Port
+    $probe.Stop()
+    $authorization = @{
+        Uri = 'https://login.microsoftonline.com/synthetic'
+        RedirectUri = "http://127.0.0.1:$port/"; State = 'synthetic-state'
+    }
+    $holder = @{ Thread = $null }
+    $launcher = {
+        param($Uri)
+        $holder.Thread = [NativeInventoryTestServer]::PostAuthForm(
+            $authorization.RedirectUri, 'code=synthetic-code&state=synthetic-state')
+    }.GetNewClosure()
+    try {
+        $result = & $module {
+            param($Authorization, $Launcher)
+            Receive-AuthCode $Authorization 30 -BrowserLauncher $Launcher
+        } $authorization $launcher
+        Assert-Equal $result.Code 'synthetic-code' 'Native form-post callback code'
+        Assert-Equal $result.State 'synthetic-state' 'Native form-post callback state'
+    }
+    finally { if ($null -ne $holder.Thread) { $holder.Thread.Join(2000) | Out-Null } }
+}
+
+function New-NativeFixtureOptions {
+    param($Fixture, [string]$Mode = 'ClientSecret', $Certificate)
+    $Fixture.AuthCalls = [Collections.Generic.List[object]]::new()
+    $Fixture.AuthChallenges = [Collections.Generic.List[string]]::new()
+    $receiver = {
+        param($Authorization, $Timeout)
+        $query = & $module { param($Text) ConvertFrom-FormBody $Text } ([Uri]$Authorization.Uri).Query.TrimStart('?')
+        Assert-Equal $query.response_mode 'form_post' 'Authorization code should not be placed in browser URL history'
+        Assert-Equal $query.code_challenge_method 'S256' 'PKCE challenge method'
+        Assert-Equal $query.redirect_uri 'http://localhost:8400/' 'Native redirect URI'
+        Assert-True ($query.scope -match 'offline_access') 'Offline access was not requested'
+        $Fixture.AuthChallenges.Add($query.code_challenge)
+        return @{ Code = 'synthetic-code'; State = $Authorization.State }
+    }.GetNewClosure()
+    $tokenRequest = {
+        param($Request)
+        Assert-True $Request.Sensitive 'Token response must remain in memory'
+        Assert-True ($Request.Uri -eq "https://login.microsoftonline.com/$($Fixture.Tenant)/oauth2/v2.0/token") 'Token authority was not tenant-bound'
+        $form = & $module { param($Text) ConvertFrom-FormBody $Text } $Request.Body
+        Assert-True ($form.grant_type -in @('authorization_code', 'refresh_token')) 'Native mode attempted unsupported app-only client credentials'
+        if ($form.grant_type -eq 'authorization_code') {
+            $challenge = & $module { param($Verifier) Get-AuthPkceChallenge $Verifier } $form.code_verifier
+            Assert-True ($Fixture.AuthChallenges.Contains($challenge)) 'PKCE verifier did not match the browser challenge'
+        }
+        if ($Mode -eq 'ClientSecret') {
+            Assert-Equal $form.client_secret 'synthetic&secret+with spaces' 'Secure secret form encoding'
+        }
+        else {
+            Assert-Equal $form.client_assertion_type 'urn:ietf:params:oauth:client-assertion-type:jwt-bearer' 'Certificate assertion type'
+            $claims = & $module { param($Token) Read-TokenClaims $Token } $form.client_assertion
+            Assert-Equal $claims.aud $Request.Uri 'Certificate assertion audience'
+            Assert-Equal $claims.iss 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa' 'Certificate client identity'
+            Assert-True ($claims.exp - $claims.iat -le 300) 'Certificate assertion is too long-lived'
+            $segments = $form.client_assertion.Split('.')
+            $payload = $segments[2].Replace('-', '+').Replace('_', '/')
+            $payload = $payload.PadRight($payload.Length + ((4 - $payload.Length % 4) % 4), '=')
+            $signature = [Convert]::FromBase64String($payload)
+            $publicKey = [Security.Cryptography.X509Certificates.RSACertificateExtensions]::GetRSAPublicKey($Certificate)
+            try {
+                Assert-True ($publicKey.VerifyData([Text.Encoding]::UTF8.GetBytes($segments[0] + '.' + $segments[1]),
+                    $signature, [Security.Cryptography.HashAlgorithmName]::SHA256,
+                    [Security.Cryptography.RSASignaturePadding]::Pss)) 'Certificate assertion signature did not verify'
+            }
+            finally { $publicKey.Dispose() }
+        }
+        $Fixture.AuthCalls.Add(@{ Grant = $form.grant_type; Scope = $form.scope })
+        $audience = $form.scope -replace '/\.default$', ''
+        return @{
+            StatusCode = 200; Headers = @{}
+            Body = ConvertTo-Json -Compress -InputObject @{
+                token_type = 'Bearer'; access_token = New-TestToken $Fixture $audience
+                refresh_token = 'synthetic-refresh-token'
+            }
+        }
+    }.GetNewClosure()
+    $options = @{
+        AuthenticationMode = $Mode; ClientId = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+        AuthCodeReceiver = $receiver; AuthTokenRequest = $tokenRequest
+    }
+    if ($Mode -eq 'ClientSecret') {
+        $options.ClientSecret = ConvertTo-SecureString 'synthetic&secret+with spaces' -AsPlainText -Force
+    }
+    else { $options.ClientCertificate = $Certificate }
+    return $options
+}
+
+Invoke-Test 'Native secret authentication runs the full inventory without Az.Accounts and refreshes across audiences' {
+    $f = New-Fixture
+    $f.NativeOptions = New-NativeFixtureOptions $f
+    $s = Invoke-Fixture $f
+    Assert-Equal $s.AuthenticationMode 'ClientSecret' 'Reported authentication mode'
+    Assert-Equal $s.ReportedApps 40 'Native secret inventory count'
+    Assert-Equal $f.AuthCalls[0].Grant 'authorization_code' 'Initial delegated grant'
+    Assert-True (@($f.AuthCalls | Where-Object Grant -eq 'refresh_token').Count -gt 0) 'Native tokens were not refreshed for Dataverse'
+    Assert-Equal $f.AuthChallenges.Count 1 'Native mode repeatedly prompted instead of refreshing'
+    Assert-True ($null -eq (Get-Module Az.Accounts)) 'Native authentication imported Az.Accounts'
+    Assert-ReportIds $f
+    foreach ($path in [IO.Directory]::EnumerateFiles($f.Output, '*', [IO.SearchOption]::AllDirectories)) {
+        if ([IO.Path]::GetFileName($path) -ne '.inventory.lock') {
+            $text = [IO.File]::ReadAllText($path)
+            Assert-True ($text -notmatch 'synthetic&secret|synthetic-refresh-token|synthetic-code|synthetic-not-a-credential') 'Native credential/code/token persisted in a report or checkpoint'
         }
     }
-    finally { $client.Dispose() }
+    Assert-True ($f.NativeOptions.ClientSecret.Length -gt 0) 'The caller-owned SecureString was disposed'
+}
+
+Invoke-Test 'Native certificate authentication signs verifiable short-lived PS256 assertions without Az.Accounts' {
+    $f = New-Fixture
+    $key = if ([Environment]::OSVersion.Platform -eq [PlatformID]::Win32NT) {
+        [Security.Cryptography.RSACng]::new(2048)
+    } else { [Security.Cryptography.RSA]::Create(2048) }
+    $request = [Security.Cryptography.X509Certificates.CertificateRequest]::new('CN=Synthetic inventory test',
+        $key, [Security.Cryptography.HashAlgorithmName]::SHA256, [Security.Cryptography.RSASignaturePadding]::Pss)
+    $certificate = $request.CreateSelfSigned($f.Now.AddDays(-1), $f.Now.AddDays(2))
+    try {
+        $f.NativeOptions = New-NativeFixtureOptions $f -Mode Certificate -Certificate $certificate
+        $s = Invoke-Fixture $f
+        Assert-Equal $s.AuthenticationMode 'Certificate' 'Reported certificate mode'
+        Assert-Equal $s.ReportedApps 40 'Native certificate inventory count'
+        Assert-True ($f.AuthCalls.Count -gt 1) 'Certificate refresh flow was not exercised'
+        Assert-True ($null -eq (Get-Module Az.Accounts)) 'Certificate mode imported Az.Accounts'
+        Assert-ReportIds $f
+    }
+    finally { $certificate.Dispose(); $key.Dispose() }
+}
+
+Invoke-Test 'Native authentication rejects mismatched callback state, missing credentials, and public redirect URLs' {
+    $f = New-Fixture
+    $f.NativeOptions = New-NativeFixtureOptions $f
+    $f.NativeOptions.AuthCodeReceiver = { @{ Code = 'synthetic-code'; State = 'wrong-state' } }
+    Assert-Throws { Invoke-Fixture $f } 'state or code validation'
+    Assert-Equal $f.AuthCalls.Count 0 'A mismatched code was sent to Microsoft'
+    $g = New-Fixture
+    $g.NativeOptions = New-NativeFixtureOptions $g
+    $g.NativeOptions.RedirectUri = 'http://outside.example.invalid/'
+    Assert-Throws { Invoke-Fixture $g } 'loopback'
+    $h = New-Fixture
+    $h.NativeOptions = New-NativeFixtureOptions $h
+    $h.NativeOptions.ClientSecret = $null
+    Assert-Throws { Invoke-Fixture $h } 'SecureString client secret'
+}
+
+Invoke-Test 'Native token errors are permanent when appropriate and never expose credential response bodies' {
+    $f = New-Fixture
+    $f.NativeOptions = New-NativeFixtureOptions $f
+    $calls = @{ Count = 0 }
+    $f.NativeOptions.AuthTokenRequest = {
+        param($Request)
+        $calls.Count++
+        return @{ StatusCode = 400; Headers = @{}; Body = '{"error_description":"synthetic-private-credential"}' }
+    }.GetNewClosure()
+    Assert-Throws { Invoke-Fixture $f } 'token request failed \(HTTP 400\)'
+    Assert-Equal $calls.Count 1 'Permanent credential error was retried'
+    Assert-True (-not [IO.File]::ReadAllText((Join-Path $f.Output 'RunSummary.json')).Contains('synthetic-private-credential')) 'Private token error body persisted'
+}
+
+Invoke-Test 'Native OAuth honors throttling, refreshes once on 401, and never switches users across audiences' {
+    $f = New-Fixture
+    $f.NativeOptions = New-NativeFixtureOptions $f
+    $original = $f.NativeOptions.AuthTokenRequest
+    $attempts = @{ Count = 0 }
+    $f.NativeOptions.AuthTokenRequest = {
+        param($Request)
+        $attempts.Count++
+        if ($attempts.Count -eq 1) {
+            return @{ StatusCode = 429; Headers = @{ 'Retry-After' = '2' }; Body = '' }
+        }
+        & $original $Request
+    }.GetNewClosure()
+    $f.Actions.Enqueue(@{ Kind = 'InventoryApps'; Status = 401; Headers = @{} })
+    $s = Invoke-Fixture $f
+    Assert-Equal $s.IncompleteSources 0 'Native throttle/401 did not recover'
+    Assert-True ($f.Sleeps.Contains([double]2000)) 'OAuth server backoff was ignored'
+    Assert-Equal @($f.AuthCalls | Where-Object Scope -eq 'https://api.powerplatform.com/.default').Count 2 'Native 401 caused a refresh storm'
+    $g = New-Fixture
+    $g.NativeOptions = New-NativeFixtureOptions $g
+    $original = $g.NativeOptions.AuthTokenRequest
+    $g.NativeOptions.AuthTokenRequest = {
+        param($Request)
+        $response = & $original $Request
+        $form = & $module { param($Text) ConvertFrom-FormBody $Text } $Request.Body
+        if ($form.scope -ne 'https://api.powerplatform.com/.default') {
+            $body = $response.Body | ConvertFrom-Json
+            $claims = & $module { param($Token) Read-TokenClaims $Token } $body.access_token
+            $claims.oid = '66666666-6666-4666-8666-666666666666'
+            $payload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $claims -Compress)))
+            $payload = $payload.TrimEnd('=').Replace('+', '-').Replace('/', '_')
+            $body.access_token = "e30.$payload.synthetic-not-a-credential"
+            $response.Body = ConvertTo-Json -InputObject $body -Compress
+        }
+        return $response
+    }.GetNewClosure()
+    Assert-Equal (Invoke-Fixture $g).ExitCode 1 'A different user token was accepted for Dataverse'
+}
+
+Invoke-Test 'Native OAuth refuses server waits beyond its budget without shortening the delay' {
+    $f = New-Fixture
+    $f.Budget = 1
+    $f.NativeOptions = New-NativeFixtureOptions $f
+    $attempts = @{ Count = 0 }
+    $f.NativeOptions.AuthTokenRequest = {
+        param($Request)
+        $attempts.Count++
+        return @{ StatusCode = 429; Headers = @{ 'Retry-After' = '120' }; Body = '' }
+    }.GetNewClosure()
+    Assert-Throws { Invoke-Fixture $f } 'retry budget was exhausted'
+    Assert-Equal $attempts.Count 1 'OAuth immediately retried a longer server-requested delay'
+    Assert-Equal $f.Sleeps.Count 0 'OAuth shortened server backoff'
+}
+
+Invoke-Test 'PKCE uses the RFC S256 test vector and auth form parsing rejects duplicates' {
+    $challenge = & $module { Get-AuthPkceChallenge 'dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk' }
+    Assert-Equal $challenge 'E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM' 'PKCE SHA256 challenge'
+    Assert-Throws { & $module { ConvertFrom-FormBody 'state=a&state=b' } } 'Duplicate'
 }
 
 Invoke-Test 'Empty tenant has stable CSV schemas and zero counts' {
@@ -604,7 +941,7 @@ Invoke-Test 'Retry-After beyond budget stops without shortening or continuing el
 
 Invoke-Test 'Network, 408, and retryable 5xx recover with finite exponential backoff' {
     $f = New-Fixture -Apps 0 -Environments 0
-    $f.Actions.Enqueue(@{ Kind = 'InventoryApps'; Throw = [System.Net.Http.HttpRequestException]::new('synthetic') })
+    $f.Actions.Enqueue(@{ Kind = 'InventoryApps'; Throw = [System.Net.WebException]::new('synthetic') })
     $f.Actions.Enqueue(@{ Kind = 'InventoryApps'; Status = 408; Headers = @{} })
     $f.Actions.Enqueue(@{ Kind = 'InventoryApps'; Status = 503; Headers = @{} })
     $s = Invoke-Fixture $f
@@ -936,6 +1273,7 @@ Invoke-Test 'Resume retries only incomplete sources and never persists tokens' {
 if (-not $SkipScale) {
     Invoke-Test "Paged end-to-end $ScaleApps apps / 250 environments, interruption and resume" {
         $f = New-Fixture -Apps $ScaleApps -Environments 250 -PageSize 1000
+        $f.NativeOptions = New-NativeFixtureOptions $f
         $f.FaultHook = {
             param($Event, $Spec, $Page)
             if ($Event -eq 'BeforeCheckpoint' -and $Spec.Kind -eq 'InventoryApps' -and $Page -eq 3) {
@@ -953,6 +1291,7 @@ if (-not $SkipScale) {
         Assert-ReportIds $f
         $scaleEvidence = @{
             PowerShellVersion = $PSVersionTable.PSVersion.ToString(); PSEdition = $PSVersionTable.PSEdition
+            AuthenticationMode = $s.AuthenticationMode
             SyntheticApps = $ScaleApps; Environments = 250
             ReportedApps = $s.ReportedApps; PremiumApps = $s.PremiumApps; ReviewApps = $s.ReviewApps
             IncompleteSources = $s.IncompleteSources; Calls = $f.Calls

@@ -1,7 +1,6 @@
 #Requires -Version 5.1
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-Add-Type -AssemblyName System.Net.Http
 
 $script:ApiRoot = 'https://api.powerplatform.com'
 $script:ApiVersion = '2024-10-01'
@@ -24,11 +23,11 @@ function Get-Field {
 
 function Get-Sha256 {
     param([string]$Text)
-    $hash = [System.Security.Cryptography.SHA256]::Create()
+    $stream = [System.IO.MemoryStream]::new($script:Utf8.GetBytes($Text))
     try {
-        return [BitConverter]::ToString($hash.ComputeHash($script:Utf8.GetBytes($Text))).Replace('-', '').ToLowerInvariant()
+        return (Get-FileHash -InputStream $stream -Algorithm SHA256).Hash.ToLowerInvariant()
     }
-    finally { $hash.Dispose() }
+    finally { $stream.Dispose() }
 }
 
 function ConvertFrom-JsonValue {
@@ -104,12 +103,7 @@ function Get-TimestampString {
 
 function Get-FileDigest {
     param([string]$Path)
-    $stream = [System.IO.File]::OpenRead($Path)
-    $hash = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        return [BitConverter]::ToString($hash.ComputeHash($stream)).Replace('-', '').ToLowerInvariant()
-    }
-    finally { $hash.Dispose(); $stream.Dispose() }
+    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 
 function Complete-AtomicFile {
@@ -240,9 +234,10 @@ function New-AzTokenProvider {
         $context.Account.Type -ne 'User' -or $context.Environment.Name -ne 'AzureCloud') {
         throw (New-InventoryError 'Select a delegated user context in the requested tenant and AzureCloud. App-only authentication is not supported.')
     }
+    $accessTokenCommand = Get-Command Get-AzAccessToken -ErrorAction Stop
     return {
         param([string]$Audience)
-        $result = Get-AzAccessToken -TenantId $TenantId -ResourceUrl $Audience `
+        $result = & $accessTokenCommand -TenantId $TenantId -ResourceUrl $Audience `
             -DefaultProfile $context -ErrorAction Stop
         if ($result.Token -is [securestring]) {
             return [System.Net.NetworkCredential]::new('', $result.Token).Password
@@ -263,7 +258,7 @@ function Get-SessionToken {
     }
     $token = & $Session.TokenProvider $Audience
     $claims = Read-TokenClaims $token
-    $expires = [DateTimeOffset]::FromUnixTimeSeconds([long](Get-Field $claims 'exp'))
+    $expires = [DateTimeOffset]::Parse('1970-01-01T00:00:00+00:00').AddSeconds([long](Get-Field $claims 'exp'))
     $audienceClaim = [string](Get-Field $claims 'aud')
     $expectedGuid = if ($Audience -eq $script:ApiRoot) {
         '8578e004-a5c6-46e7-913e-12f58912df43'
@@ -272,6 +267,7 @@ function Get-SessionToken {
         [string]::IsNullOrWhiteSpace((Get-Field $claims 'oid')) -or
         [string]::IsNullOrWhiteSpace((Get-Field $claims 'scp')) -or
         (Get-Field $claims 'idtyp') -eq 'app' -or $expires -le $now.AddSeconds(30) -or
+        ($Session.PrincipalId -and (Get-Field $claims 'oid') -ine $Session.PrincipalId) -or
         ($audienceClaim.TrimEnd('/') -ine $Audience.TrimEnd('/') -and $audienceClaim -ine $expectedGuid)) {
         throw (New-InventoryError 'Token tenant, delegated identity, audience, or expiry validation failed. Sign in again to the requested tenant.')
     }
@@ -327,67 +323,109 @@ function Get-RetryDelayMilliseconds {
     return [Math]::Min(60000, 1000 * [Math]::Pow(2, $Attempt)) + (Get-Random -Minimum 0 -Maximum 1001)
 }
 
-function Get-HttpTaskResult {
-    param(
-        [System.Threading.Tasks.Task]$Task,
-        [System.Threading.Tasks.Task]$Deadline,
-        [System.Threading.CancellationToken]$Token
-    )
-    $finished = [System.Threading.Tasks.Task]::WhenAny(
-        [System.Threading.Tasks.Task[]]@($Task, $Deadline)
-    ).GetAwaiter().GetResult()
-    if ([object]::ReferenceEquals($finished, $Deadline)) {
-        throw [System.OperationCanceledException]::new('HTTP request deadline exceeded; operation canceled.', $Token)
-    }
-    return $Task.GetAwaiter().GetResult()
-}
-
 function Invoke-HttpTransport {
     param($Session, $Request)
-    $cancellation = [System.Threading.CancellationTokenSource]::new(
-        [TimeSpan]::FromSeconds($Session.RequestTimeoutSeconds)
-    )
-    $deadline = [System.Threading.Tasks.Task]::Delay(-1, $cancellation.Token)
-    $message = [System.Net.Http.HttpRequestMessage]::new(
-        [System.Net.Http.HttpMethod]::new($Request.Method), $Request.Uri
-    )
-    try {
-        foreach ($key in $Request.Headers.Keys) {
-            $message.Headers.TryAddWithoutValidation($key, [string]$Request.Headers[$key]) | Out-Null
-        }
-        if ($null -ne $Request.Body) {
-            $message.Content = [System.Net.Http.StringContent]::new(
-                (ConvertTo-InventoryJson $Request.Body),
-                $script:Utf8, 'application/json'
-            )
-        }
-        $send = $Session.HttpClient.SendAsync(
-            $message, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead, $cancellation.Token
-        )
-        $response = Get-HttpTaskResult $send $deadline $cancellation.Token
-        try {
-            $headers = @{}
-            foreach ($header in $response.Headers) { $headers[$header.Key] = $header.Value -join ',' }
-            $content = Get-HttpTaskResult ($response.Content.ReadAsStreamAsync()) $deadline $cancellation.Token
-            $buffer = [byte[]]::new(65536)
-            $body = [System.IO.MemoryStream]::new()
-            try {
-                while (($read = Get-HttpTaskResult ($content.ReadAsync(
-                            $buffer, 0, $buffer.Length, $cancellation.Token
-                        )) $deadline $cancellation.Token) -gt 0) {
-                    if ($body.Length + $read -gt 64MB) {
-                        throw (New-InventoryError 'API response exceeded the 64 MiB page safety limit. Use a smaller PageSize.')
-                    }
-                    $body.Write($buffer, 0, $read)
-                }
-                $text = $script:Utf8.GetString($body.ToArray())
-            }
-            finally { $body.Dispose(); $content.Dispose() }
-            return @{ StatusCode = [int]$response.StatusCode; Headers = $headers; Body = $text }
-        }
-        finally { $response.Dispose() }
+    $sensitive = (Get-Field $Request 'Sensitive') -eq $true
+    $temporary = if (-not $sensitive) {
+        Join-Path ([IO.Path]::GetTempPath()) ('ppi-http-' + [guid]::NewGuid().ToString('N') + '.json')
+    } else { '' }
+    $parameters = @{
+        Uri = $Request.Uri; Method = $Request.Method; Headers = $Request.Headers
+        UseBasicParsing = $true; MaximumRedirection = 0
+        TimeoutSec = $Session.RequestTimeoutSeconds; ErrorAction = 'Stop'
     }
-    finally { $message.Dispose(); $cancellation.Cancel(); $cancellation.Dispose() }
+    if ($temporary) { $parameters.OutFile = $temporary; $parameters.PassThru = $true }
+    if ($null -ne $Request.Body) {
+        $form = (Get-Field $Request 'ContentType') -eq 'application/x-www-form-urlencoded'
+        $parameters.Body = if ($form) { $Request.Body } else { ConvertTo-InventoryJson $Request.Body }
+        $parameters.ContentType = if ($form) { 'application/x-www-form-urlencoded' } else { 'application/json' }
+    }
+    if (-not $Session.ContainsKey('NativeWebRunner') -or $null -eq $Session.NativeWebRunner) {
+        $Session.NativeWebRunner = [PowerShell]::Create()
+    }
+    $runner = $Session.NativeWebRunner
+    $runner.Commands.Clear()
+    $runner.Streams.Error.Clear()
+    # A single reused runspace lets us stop native downloads at the whole-request deadline/size limit.
+    $runner.AddScript({
+        param($Parameters)
+        $ErrorActionPreference = 'Stop'
+        $previousTls = [Net.ServicePointManager]::SecurityProtocol
+        try {
+            if ($PSVersionTable.PSEdition -eq 'Desktop') {
+                [Net.ServicePointManager]::SecurityProtocol = $previousTls -bor [Net.SecurityProtocolType]::Tls12
+            }
+            $response = Invoke-WebRequest @Parameters
+            @{
+                StatusCode = [int]$response.StatusCode; Headers = $response.Headers
+                Body = $(if (-not $Parameters.ContainsKey('OutFile')) { $response.Content } else { '' })
+            }
+        }
+        catch {
+            $response = $_.Exception.PSObject.Properties['Response']
+            $status = 0; $headers = @{}
+            if ($null -ne $response -and $null -ne $response.Value) {
+                $status = [int]$response.Value.StatusCode
+                $headers = $response.Value.Headers
+            }
+            @{ StatusCode = $status; Headers = $headers; Body = '' }
+        }
+        finally { [Net.ServicePointManager]::SecurityProtocol = $previousTls }
+    }.ToString(), $true).AddArgument($parameters) | Out-Null
+    $operation = $runner.BeginInvoke()
+    $watch = [Diagnostics.Stopwatch]::StartNew()
+    try {
+        while (-not $operation.AsyncWaitHandle.WaitOne(50)) {
+            if ($watch.Elapsed.TotalSeconds -ge $Session.RequestTimeoutSeconds) {
+                $runner.Stop()
+                throw [TimeoutException]::new('Native web request deadline exceeded.')
+            }
+            if ($temporary -and [IO.File]::Exists($temporary) -and
+                ([IO.FileInfo]::new($temporary)).Length -gt 64MB) {
+                $runner.Stop()
+                throw (New-InventoryError 'API response exceeded the 64 MiB page safety limit. Use a smaller PageSize.')
+            }
+        }
+        $results = $runner.EndInvoke($operation)
+        if ($results.Count -ne 1) {
+            throw (New-InventoryError 'The native web request returned an invalid result; no empty response fallback was used.')
+        }
+        $response = $results[0].PSObject.BaseObject
+        if ($response.StatusCode -eq 0) {
+            throw [Net.WebException]::new('Native web request failed. Check connectivity, TLS, proxy settings, and the endpoint.')
+        }
+        $headers = @{}
+        if ($response.Headers -is [Collections.Specialized.NameValueCollection]) {
+            foreach ($name in $response.Headers.AllKeys) { $headers[$name] = $response.Headers[$name] }
+        }
+        elseif ($response.Headers -is [Collections.IDictionary]) {
+            foreach ($name in $response.Headers.Keys) { $headers[$name] = @($response.Headers[$name]) -join ',' }
+        }
+        else {
+            foreach ($header in $response.Headers) { $headers[$header.Key] = @($header.Value) -join ',' }
+        }
+        $text = ''
+        if ($temporary -and [IO.File]::Exists($temporary)) {
+            if (([IO.FileInfo]::new($temporary)).Length -gt 64MB) {
+                throw (New-InventoryError 'API response exceeded the 64 MiB page safety limit. Use a smaller PageSize.')
+            }
+            $text = [IO.File]::ReadAllText($temporary, $script:Utf8)
+        }
+        elseif ($sensitive) {
+            $text = if ($response.Body -is [byte[]]) { $script:Utf8.GetString($response.Body) } else { [string]$response.Body }
+            if ($script:Utf8.GetByteCount($text) -gt 1MB) {
+                throw (New-InventoryError 'The authentication response exceeded its safety limit.')
+            }
+        }
+        return @{ StatusCode = [int]$response.StatusCode; Headers = $headers; Body = $text }
+    }
+    finally {
+        $runner.Commands.Clear()
+        $parameters.Clear()
+        $runner.Streams.Error.Clear()
+        $operation.AsyncWaitHandle.Dispose()
+        if ($temporary -and [IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) }
+    }
 }
 
 function Invoke-InventoryRequest {
@@ -423,7 +461,7 @@ function Invoke-InventoryRequest {
             else { $response = Invoke-HttpTransport $Session $request }
             $status = [int]$response.StatusCode
         }
-        catch [System.Net.Http.HttpRequestException], [System.OperationCanceledException],
+        catch [System.Net.WebException], [System.OperationCanceledException],
               [System.TimeoutException], [System.IO.IOException] {
             $networkFailure = $true
             $status = 0
@@ -984,6 +1022,7 @@ function Export-InventoryReports {
     $summary = [ordered]@{
         FormatVersion = $script:FormatVersion; RunId = $Checkpoint.RunId
         TenantId = $Session.TenantId; Cloud = 'Commercial'; PrincipalObjectId = $Session.PrincipalId
+        AuthenticationMode = $Session.AuthenticationMode
         StartedUtc = Get-TimestampString $Checkpoint.StartedUtc
         GeneratedUtc = (& $Session.Clock).ToString('o')
         Status = 'Incomplete'; ExitCode = 1; ReportsCurrent = $false
@@ -1117,13 +1156,36 @@ function Invoke-DeveloperPremiumInventory {
         [ValidateRange(1, 600)][int]$RequestTimeoutSeconds = 120,
         [switch]$Resume,
         [switch]$UseExistingContext,
+        [ValidateSet('Auto', 'AzAccounts', 'ClientSecret', 'Certificate')][string]$AuthenticationMode = 'Auto',
+        [guid]$ClientId,
+        [securestring]$ClientSecret,
+        [Security.Cryptography.X509Certificates.X509Certificate2]$ClientCertificate,
+        [string]$RedirectUri = 'http://localhost:8400/',
+        [ValidateRange(30, 1800)][int]$LoginTimeoutSeconds = 600,
         [scriptblock]$TokenProvider,
         [scriptblock]$Transport,
         [scriptblock]$Sleep = { param($Milliseconds) Start-Sleep -Milliseconds ([long]$Milliseconds) },
         [scriptblock]$Clock = { [DateTimeOffset]::UtcNow },
-        [scriptblock]$FaultHook
+        [scriptblock]$FaultHook,
+        [scriptblock]$AuthCodeReceiver,
+        [scriptblock]$AuthTokenRequest
     )
     $tenant = $TenantId.ToString()
+    if ($null -ne $ClientSecret -and $null -ne $ClientCertificate) {
+        throw (New-InventoryError 'Choose a client secret or a certificate, not both.')
+    }
+    if ($AuthenticationMode -eq 'Auto') {
+        $AuthenticationMode = if ($null -ne $ClientCertificate) { 'Certificate' }
+            elseif ($ClientId -ne [guid]::Empty -or $null -ne $ClientSecret) { 'ClientSecret' }
+            else { 'AzAccounts' }
+    }
+    if ($AuthenticationMode -eq 'AzAccounts' -and
+        ($ClientId -ne [guid]::Empty -or $null -ne $ClientSecret -or $null -ne $ClientCertificate)) {
+        throw (New-InventoryError 'AzAccounts mode does not accept client credentials. Select ClientSecret or Certificate mode.')
+    }
+    if ($AuthenticationMode -ne 'AzAccounts' -and $UseExistingContext) {
+        throw (New-InventoryError 'UseExistingContext applies only to AzAccounts authentication.')
+    }
     $root = [System.IO.Path]::GetFullPath($OutputDirectory)
     if ($root -match '[\r\n]') { throw (New-InventoryError 'Output directory cannot contain line breaks.') }
     [System.IO.Directory]::CreateDirectory($root) | Out-Null
@@ -1178,15 +1240,6 @@ function Invoke-DeveloperPremiumInventory {
             Status = 'Running'; ExitCode = 1; ReportsCurrent = $false
             RunId = $checkpoint.RunId; TenantId = $tenant; StartedUtc = $checkpoint.StartedUtc
         }
-        if ($null -eq $TokenProvider) { $TokenProvider = New-AzTokenProvider $tenant -UseExistingContext:$UseExistingContext }
-        $handler = [System.Net.Http.HttpClientHandler]::new()
-        $handler.AllowAutoRedirect = $false
-        $handler.UseCookies = $false
-        if ($PSVersionTable.PSEdition -eq 'Desktop') {
-            $handler.SslProtocols = [System.Security.Authentication.SslProtocols]::Tls12
-        }
-        $client = [System.Net.Http.HttpClient]::new($handler)
-        $client.Timeout = [TimeSpan]::FromSeconds($RequestTimeoutSeconds)
         $session = @{
             Root = $root; TenantId = $tenant; PageSize = $PageSize
             RequestIntervalMilliseconds = $RequestIntervalMilliseconds
@@ -1194,7 +1247,26 @@ function Invoke-DeveloperPremiumInventory {
             RequestTimeoutSeconds = $RequestTimeoutSeconds
             TokenProvider = $TokenProvider; Transport = $Transport; Sleep = $Sleep; Clock = $Clock
             FaultHook = $FaultHook; Tokens = @{}; NotBefore = [DateTimeOffset]::MinValue
-            HttpClient = $client; Requests = 0L; Halt = $false; PrincipalId = ''
+            NativeWebRunner = $null; NativeAuthState = $null
+            AuthenticationMode = $AuthenticationMode
+            Requests = 0L; Halt = $false; PrincipalId = ''
+        }
+        if ($null -eq $TokenProvider) {
+            if ($AuthenticationMode -eq 'AzAccounts') {
+                $session.TokenProvider = New-AzTokenProvider $tenant -UseExistingContext:$UseExistingContext
+            }
+            else {
+                $session.NativeAuthState = New-NativeAuthState -Session $session -Mode $AuthenticationMode `
+                    -ClientId $ClientId -ClientSecret $ClientSecret -ClientCertificate $ClientCertificate `
+                    -RedirectUri $RedirectUri -LoginTimeoutSeconds $LoginTimeoutSeconds `
+                    -CodeReceiver $AuthCodeReceiver -TokenRequest $AuthTokenRequest
+                $nativeState = $session.NativeAuthState
+                $nativeTokenCommand = ${function:Get-NativeAccessToken}
+                $session.TokenProvider = {
+                    param($Audience)
+                    & $nativeTokenCommand $nativeState $Audience
+                }.GetNewClosure()
+            }
         }
         Get-SessionToken $session $script:ApiRoot | Out-Null
         $environments = Invoke-Source $session (New-SourceSpec 'InventoryEnvironments' $tenant)
@@ -1230,7 +1302,12 @@ function Invoke-DeveloperPremiumInventory {
         throw
     }
     finally {
-        if ($null -ne $session) { $session.Tokens.Clear(); $session.HttpClient.Dispose() }
+        if ($null -ne $session) {
+            $session.Tokens.Clear()
+            if ($null -ne $session.NativeAuthState) { Close-NativeAuthState $session.NativeAuthState }
+            if ($null -ne $session.NativeWebRunner) { $session.NativeWebRunner.Dispose() }
+            $session.TokenProvider = $null
+        }
         $lock.Dispose()
     }
 }
@@ -1363,5 +1440,7 @@ function ConvertTo-InventoryRecord {
         PublicationState = $published; Source = $kind
     }
 }
+
+. (Join-Path $PSScriptRoot 'Authentication.ps1')
 
 Export-ModuleMember -Function Invoke-DeveloperPremiumInventory
