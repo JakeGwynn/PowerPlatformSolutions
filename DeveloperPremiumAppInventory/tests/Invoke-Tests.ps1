@@ -345,6 +345,15 @@ if ($ProcessProbe) {
     exit 0
 }
 
+Invoke-Test 'Public command exposes its synopsis, parameters, and runnable help examples' {
+    $scriptPath = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\Get-UnmanagedDeveloperPremiumApps.ps1'))
+    $ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$null, [ref]$null)
+    $help = $ast.GetHelpContent()
+    Assert-True ($null -ne $help) 'PowerShell did not recognize the comment-based help'
+    Assert-True ($help.Synopsis -match 'unmanaged Developer') 'Missing public synopsis'
+    Assert-Equal @($help.Examples).Count 2 'Missing runnable invocation/resume examples'
+}
+
 Invoke-Test 'Actual HTTP transport reads content and enforces a response-body timeout' {
     Add-Type -TypeDefinition @'
 using System;
@@ -421,6 +430,16 @@ Invoke-Test 'Empty tenant has stable CSV schemas and zero counts' {
     foreach ($name in @('AllApps.csv', 'PremiumApps.csv', 'ReviewApps.csv', 'Environments.csv', 'Coverage.csv', 'Failures.csv')) {
         Assert-True ([IO.File]::ReadAllText((Join-Path $f.Output $name)).StartsWith('"')) 'Missing CSV header'
     }
+}
+
+Invoke-Test 'A different tenant uses its own identity and tenant-bound queries without editing code' {
+    $f = New-Fixture
+    $f.Tenant = '99999999-9999-4999-8999-999999999999'
+    $f.TokenTenant = $f.Tenant
+    $s = Invoke-Fixture $f
+    Assert-Equal $s.TenantId $f.Tenant 'The operator tenant was not propagated'
+    Assert-Equal $s.ReportedApps 40 'Alternate tenant app count'
+    Assert-ReportIds $f
 }
 
 Invoke-Test 'All app types, unpublished modules, owners, regions, and excluded environments' {

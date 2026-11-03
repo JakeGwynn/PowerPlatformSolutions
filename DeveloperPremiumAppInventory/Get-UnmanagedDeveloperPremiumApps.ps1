@@ -1,4 +1,5 @@
 #Requires -Version 7.4
+
 <#
 .SYNOPSIS
 Inventories premium-capability apps in unmanaged Developer environments, tenant-wide.
