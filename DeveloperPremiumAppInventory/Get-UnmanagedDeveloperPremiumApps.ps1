@@ -40,10 +40,10 @@ rather than being shortened. Default 900 seconds.
 Timeout for each HTTP attempt, including reading its response body. Default 120.
 
 .EXAMPLE
-pwsh -File .\Get-UnmanagedDeveloperPremiumApps.ps1 -TenantId '<tenant-guid>' -OutputDirectory 'C:\Reports\DeveloperApps'
+pwsh -File .\Get-UnmanagedDeveloperPremiumApps.ps1 -TenantId 'YOUR-TENANT-GUID' -OutputDirectory 'C:\Reports\DeveloperApps'
 
 .EXAMPLE
-pwsh -File .\Get-UnmanagedDeveloperPremiumApps.ps1 -TenantId '<tenant-guid>' -OutputDirectory 'C:\Reports\DeveloperApps' -Resume -UseExistingContext
+pwsh -File .\Get-UnmanagedDeveloperPremiumApps.ps1 -TenantId 'YOUR-TENANT-GUID' -OutputDirectory 'C:\Reports\DeveloperApps' -Resume -UseExistingContext
 
 .NOTES
 Exit codes: 0 = complete within documented scope, 1 = incomplete/failed,

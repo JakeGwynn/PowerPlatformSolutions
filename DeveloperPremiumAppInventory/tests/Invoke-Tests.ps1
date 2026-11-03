@@ -352,6 +352,9 @@ Invoke-Test 'Public command exposes its synopsis, parameters, and runnable help 
     Assert-True ($null -ne $help) 'PowerShell did not recognize the comment-based help'
     Assert-True ($help.Synopsis -match 'unmanaged Developer') 'Missing public synopsis'
     Assert-Equal @($help.Examples).Count 2 'Missing runnable invocation/resume examples'
+    foreach ($example in (Get-Help $scriptPath -Full).examples.example) {
+        Assert-True ($example.code -match '^pwsh -File ') 'PowerShell help truncated the invocation example'
+    }
 }
 
 Invoke-Test 'Actual HTTP transport reads content and enforces a response-body timeout' {
