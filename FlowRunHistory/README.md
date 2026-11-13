@@ -91,6 +91,9 @@ genuinely minimal: **only `RecordId`**, with no type/context/payload columns.
 Columns preserve run and operation statuses, UTC times/durations, definition paths,
 iteration names/indexes, tracking/request/correlation IDs, errors, payload
 availability, coverage/issues, and extracted record/site/list context.
+Normal pipeline, JSON, and CSV results retain the explicit `TenantId`, so records
+from different tenants remain distinguishable. Only `-IdOnly` deliberately omits
+tenant and other context.
 Nested payloads, errors, retry history, metadata, and correlation objects use
 compact, valid `*Json` cells rather than `System.Object[]` or formatted tables.
 For example:
@@ -260,7 +263,7 @@ assuming page order. Run IDs can be combined with all filters; a found but
 filtered-out ID is not a missing ID. A nonexistent requested ID is an error.
 Run names without flow IDs require searching the discovered flows.
 
-Summary objects contain environment, flow, run, status, and UTC start/end times.
+Summary objects contain tenant, environment, flow, run, status, and UTC start/end times.
 `-Errors` adds structured errors with source/action/repetition context,
 code, message, and details. A null message means the service returned no message;
 a generic run error never replaces a more specific action-output error.
@@ -353,6 +356,12 @@ Export regressions cover fixed/minimal CSV layouts, quote/newline/Unicode
 round-trips, locale-independent durations, zero/one/many JSON arrays, simultaneous
 formats, existing/concurrently created destinations, late failures, pipeline
 interruption, redaction, and staging cleanup.
+Coordinated live reader and direct JSON/CSV export checks also passed on Windows PowerShell 5.1.26100.9711
+and PowerShell 7.7.0 in **one demo tenant**, using solution-aware Dataverse and
+SharePoint flows with independently known triggering IDs, real payloads, nested
+iterations, and failed-action messages. **A second real tenant has not been
+tested**: alternate-tenant coverage here is claim/context validation and fixtures,
+not proof that another tenant's permissions or authentication policy permits access.
 **Fixture tests do not establish live API compatibility or cross-tenant access.**
 Live validation requires an authorized delegated user/token, an environment,
 retained run IDs, and representative Dataverse/SharePoint/loop/secured runs.

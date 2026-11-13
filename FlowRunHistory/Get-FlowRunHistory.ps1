@@ -187,7 +187,7 @@ $exportResultCount = 0
 $csvParameters = @{ Delimiter = ',' }
 if ($PSVersionTable.PSVersion.Major -lt 6) { $csvParameters.NoTypeInformation = $true }
 $csvColumns = @(
-    'RowType', 'EnvironmentName', 'FlowId', 'FlowDisplayName', 'RunId', 'RunStatus',
+    'RowType', 'TenantId', 'EnvironmentName', 'FlowId', 'FlowDisplayName', 'RunId', 'RunStatus',
     'RunStartTimeUtc', 'RunEndTimeUtc', 'RunDurationSeconds', 'OperationName', 'DefinitionPath',
     'RepetitionName', 'OperationId', 'Status', 'Code', 'StartTimeUtc', 'EndTimeUtc', 'DurationSeconds',
     'ClientTrackingId', 'TrackingId', 'ActionTrackingId', 'ClientRequestId', 'ServiceRequestId',
@@ -1060,7 +1060,7 @@ function ConvertTo-CsvOperationRow {
     $correlation = Get-Field $properties 'correlation'
     $runCorrelation = Get-Field $runProperties 'correlation'
     $row.RowType = $RowType
-    foreach ($field in @('EnvironmentName', 'FlowId', 'RunId')) { $row[$field] = Get-Field $Result $field }
+    foreach ($field in @('TenantId', 'EnvironmentName', 'FlowId', 'RunId')) { $row[$field] = Get-Field $Result $field }
     $row.FlowDisplayName = $Context.FlowDisplayName
     $row.RunStatus = Get-Field $runProperties 'status'
     $row.RunStartTimeUtc = Get-ExportTime $runProperties 'startTime'
@@ -1275,7 +1275,7 @@ function Convert-RunResult {
     $properties = Get-Field $Run 'properties'
     $ExportContext.Run = $Run
     $result = [ordered]@{
-        EnvironmentName = $EnvironmentName; FlowId = $id
+        TenantId = $TenantId.ToString(); EnvironmentName = $EnvironmentName; FlowId = $id
         FlowDisplayName = (Get-Field (Get-Field $Flow 'properties') 'displayName')
         RunId = $runName; Status = (Get-Field $properties 'status')
         StartTime = $null; EndTime = $null
@@ -1326,7 +1326,7 @@ function Convert-RunResult {
             return
         }
         if (-not ($All -or $Errors)) {
-            $result = [ordered]@{ EnvironmentName = $EnvironmentName; FlowId = $id; RunId = $runName }
+            $result = [ordered]@{ TenantId = $TenantId.ToString(); EnvironmentName = $EnvironmentName; FlowId = $id; RunId = $runName }
         }
         $result.CallingRecord = $record
     }

@@ -583,6 +583,20 @@ try {
         Assert-Equal $items.Count 5
         Assert-True (@(Get-Requests | Where-Object { -not $_.HasAuthorization }).Count -eq 0) 'Flow request was not authenticated.'
     }
+    Invoke-Test 'TenantId remains explicit in every normal result projection without an extra tenant lookup' {
+        foreach ($mode in @(@{}, @{ CallingRecordId = $true }, @{ Errors = $true }, @{ All = $true })) {
+            Set-Scenario
+            $options = @{
+                FlowId = $flowA; RunId = 'run-failed'; TenantId = $otherTenant
+                AccessToken = (New-TestToken -Tenant $otherTenant)
+            }
+            foreach ($key in $mode.Keys) { $options[$key] = $mode[$key] }
+            $items = @(Invoke-History $options)
+            Assert-Equal $items.Count 1
+            Assert-Equal $items[0].TenantId $otherTenant
+            if ($mode.Count -eq 0) { Assert-Equal @(Get-Requests).Count 1 }
+        }
+    }
     Invoke-Test 'Wrong tenant/audience, expired/not-yet-valid, app-only, and malformed tokens send no requests' {
         $tokens = @(
             (New-TestToken -Tenant $otherTenant),
@@ -646,6 +660,8 @@ try {
                 $decoded = @($decoded)
                 Assert-Equal $decoded.Count $count
                 Assert-Equal $decoded[0].RunId $items[0].RunId
+                Assert-Equal $decoded[0].TenantId $tenant
+                Assert-Equal $items[0].TenantId $tenant
                 Assert-Equal $items[0].FlowDisplayName "Fixture flow $flowA"
             }
             Assert-NoStagingFiles
@@ -659,7 +675,7 @@ try {
         Assert-Equal $none.Count 0
         Assert-Equal @(Import-Csv -LiteralPath $emptyCsv -Encoding UTF8).Count 0
         $header = [IO.File]::ReadAllText($emptyCsv).Trim()
-        Assert-True ($header.StartsWith('"RowType","EnvironmentName","FlowId","FlowDisplayName","RunId"')) 'Stable header missing.'
+        Assert-True ($header.StartsWith('"RowType","TenantId","EnvironmentName","FlowId","FlowDisplayName","RunId"')) 'Stable header missing.'
         Assert-True ($header -match '"MetadataJson"') 'Lossless metadata column missing.'
         Assert-Equal ([IO.File]::ReadAllText($emptyJson).Trim()) '[]'
         $csv = Get-TestExportPath 'csv'
@@ -688,6 +704,7 @@ try {
             Assert-True ($type -in $rows.RowType) "$type rows are missing."
         }
         Assert-True (@($rows | Where-Object RecordId -ne $rowId).Count -eq 0) 'Record context was lost on operation rows.'
+        Assert-True (@($rows | Where-Object TenantId -ne $tenant).Count -eq 0) 'Tenant context was lost on operation rows.'
         $inner = @($rows | Where-Object { $_.RowType -eq 'Action' -and $_.OperationName -eq 'Inner' })[0]
         Assert-Equal $inner.ClientTrackingId 'action-client-track'
         Assert-Equal $inner.ActionTrackingId 'action-track-Inner'
@@ -768,6 +785,7 @@ try {
                 Assert-Equal $rows[0].RecordId '42'
                 Assert-Equal @($rows[0].PSObject.Properties.Name).Count 1
                 Assert-Equal (@([IO.File]::ReadAllText($json) | ConvertFrom-Json)[0]) '42'
+                Assert-True ([IO.File]::ReadAllText($json) -notmatch 'TenantId') 'IdOnly JSON was expanded with tenant context.'
             }
             Assert-NoStagingFiles
         }
@@ -782,6 +800,7 @@ try {
         $rows = @(Import-Csv -LiteralPath $csv -Encoding UTF8)
         Assert-Equal $rows.Count 1
         Assert-Equal $rows[0].RecordId '42'
+        Assert-Equal $rows[0].TenantId $tenant
         Assert-Equal $rows[0].SiteUrl 'https://contoso.sharepoint.com/sites/fixture'
         Assert-Equal $rows[0].FlowDisplayName "Fixture flow $flowB"
         Assert-Equal $rows[0].InputsJson ''
