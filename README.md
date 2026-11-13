@@ -4,7 +4,8 @@
   tenant-wide PowerShell inventory of premium-capability apps in unmanaged Developer
   environments, with resumable paging, throttling protection, and explicit coverage/review reports.
 - [Flow run history](FlowRunHistory/README.md): PowerShell 5.1/7 cloud-flow history,
-  trigger/action details, error messages, and Dataverse/SharePoint calling record IDs.
+  trigger/action details, error messages, Dataverse/SharePoint calling record IDs,
+  and direct JSON/CSV exports.
 
 
 Copyright 2025 Jake Gwynn

@@ -35,8 +35,8 @@ $flows = @(
 .\Get-FlowRunHistory.ps1 @p -AllFlows -AsAdmin -Status Failed -LastDays 14 -Errors
 
 # One run, including available trigger/action inputs, outputs, and repetitions.
-$details = .\Get-FlowRunHistory.ps1 @p -FlowId $flow -RunId $run -All
-$details | ConvertTo-Json -Depth 100 | Set-Content -LiteralPath '.\run-details.json' -Encoding UTF8
+$details = .\Get-FlowRunHistory.ps1 @p -FlowId $flow -RunId $run -All `
+    -JsonPath '.\run-details.json'
 
 # Multiple runs; IDs may belong to any of the selected flows.
 $runs = $run, '08586653536760200319026785874CU63'
@@ -53,6 +53,80 @@ and shared flows and requests solution cloud flows; it cannot enumerate flows
 hidden from the user. Admin discovery uses the `/scopes/admin/.../v2/flows` API.
 An admin's ability to enumerate flows/runs **does not grant access to every
 run's detailed inputs/outputs**.
+
+## Export JSON and/or CSV directly
+
+Use either export parameter, or both. **Files must be new**, and their parent
+directories must already exist. Pipeline objects remain available:
+
+```powershell
+# Full structured JSON plus one CSV file for inspection/filtering.
+$stamp = [DateTimeOffset]::UtcNow.ToString('yyyyMMddTHHmmssfffZ')
+$results = .\Get-FlowRunHistory.ps1 @p -FlowId $flows -Status Failed -LastDays 7 `
+    -All -CsvPath ".\failed-$stamp.csv" -JsonPath ".\failed-$stamp.json"
+
+# CSV error/operation rows, without unnecessarily downloading action inputs.
+.\Get-FlowRunHistory.ps1 @p -FlowId $flow -LastDays 7 -Errors `
+    -CsvPath ".\errors-$stamp.csv" | Out-Null
+
+# Exactly one CSV column, RecordId, and a JSON array of ID strings.
+.\Get-FlowRunHistory.ps1 @p -FlowId $flows -CallingRecordId -IdOnly `
+    -RecordSource SharePoint -CsvPath ".\item-ids-$stamp.csv" -JsonPath ".\item-ids-$stamp.json"
+```
+
+`-JsonPath` writes the **structured reader output**, not the CSV projection.
+Use `-All` for full run/trigger/action/repetition data. It is always an array:
+`[]` for no matches, `[oneResult]` for one run, and `[result1,result2,...]` for
+multiple runs. `-IdOnly` instead writes `["id1","id2",...]`. JSON is UTF-8
+without a BOM. CSV is comma-delimited UTF-8 with a BOM on both engines, with
+standard CSV quoting for commas, quotes, and embedded newlines.
+
+The normal CSV schema is fixed even for no matches (a **header-only** file).
+`RowType` identifies Run, Trigger, Action, ActionRepetition, or ScopeRepetition.
+Summary mode produces run rows; detailed modes produce operation/repetition rows
+from the information already retrieved. Record-only mode produces run/record
+context without persisting the trigger business payload. `-IdOnly` CSV is
+genuinely minimal: **only `RecordId`**, with no type/context/payload columns.
+
+Columns preserve run and operation statuses, UTC times/durations, definition paths,
+iteration names/indexes, tracking/request/correlation IDs, errors, payload
+availability, coverage/issues, and extracted record/site/list context.
+Nested payloads, errors, retry history, metadata, and correlation objects use
+compact, valid `*Json` cells rather than `System.Object[]` or formatted tables.
+For example:
+
+```powershell
+$rows = Import-Csv -LiteralPath ".\failed-$stamp.csv" -Encoding UTF8
+$rows | Where-Object RowType -eq 'ActionRepetition' |
+    Select-Object FlowDisplayName,RunId,OperationName,RepetitionName,Status,ErrorMessage
+($rows | Where-Object RowType -eq 'Trigger' | Select-Object -First 1).OutputsJson |
+    ConvertFrom-Json
+```
+
+Treat CSV as data and import untrusted business strings as text in spreadsheet
+applications; the exporter does not rewrite values that resemble formulas.
+Spreadsheet cell-length limits can hide large JSON cells: inspect the separate
+JSON file when you need the full structured data.
+
+Exports stream to private `.flow-history-*.partial` staging files in the chosen
+directories. **Final files are published only after all selection/paging/auth
+work succeeds**, using no-overwrite, same-directory moves. A terminating error
+or stopped pipeline discards staging files instead of publishing incomplete
+history. Known secured/unavailable service data is different: those results are
+exported with explicit `Partial` coverage, availability, and issues.
+
+Each final file is published atomically; two separate file renames are not a
+filesystem transaction. If an OS/race failure occurs between renames, the error
+identifies any already-published file, which contains the **complete retrieved
+results**, and leaves it intact rather than risking deletion of another writer's
+changes. No existing destination is overwritten. A process/power crash can leave
+private `.partial` files; these are not final exports and may contain sensitive
+business data. Use a protected output directory and clean up those exact files.
+
+Detailed explicit selections fill known flow display names. Summary exports
+request a missing display name once per flow (cached); ordinary summary mode
+still avoids those extra metadata calls. A denied name lookup warns and retains
+the flow ID rather than pretending the name is known.
 
 ## Authentication and other tenants
 
@@ -72,6 +146,12 @@ Choose either:
    The token must be issued for the Flow service, not Graph, ARM, or Dataverse.
    The recognized Flow audiences are `https://service.flow.microsoft.com/`
    and `https://api.flow.microsoft.com/`.
+
+For **token acquisition**, use `https://service.flow.microsoft.com/`. The API
+host `https://api.flow.microsoft.com` is not interchangeable with that resource:
+requesting a token for the API-host URI can fail with `AADSTS500011` (resource
+principal not found). Accepting an externally issued token's audience does not
+mean that every tenant has an application principal for that audience.
 
 Nothing installs automatically. If you choose Az.Accounts, install it yourself
 in the engine you will use, subject to your organization's installation policy.
@@ -212,6 +292,18 @@ and those details are then marked unavailable/unsupported. The related Logic App
 REST documentation describes the operation shapes, **not an authorization or
 compatibility promise for Power Automate**.
 
+Live checks of solution-aware Dataverse/SharePoint runs observed ordinary
+`repetitions` returning the two iterations of actions **inside** a foreach, and
+`scopeRepetitions` returning the two foreach iterations. Top-level scalar actions
+returned HTTP 404 for ordinary repetitions; non-foreach actions returned HTTP 400
+with `WorkflowRunActionTypeUnsupported` for scoped repetitions. Containers and
+actions that fail before evaluating inputs can legitimately have no payloads.
+These observations are not a general API guarantee. The reader conservatively
+retains those unavailable/unsupported issues, so even a run whose meaningful
+payloads downloaded successfully can have `Partial` coverage. Inspect individual
+issues rather than treating `Partial` as proof of data loss, or suppressing unknown
+missing data to make a run look complete.
+
 All collection pages are followed, with cycle and same-origin/same-collection
 guards. 408/429/500/502/503/504 and connection failures use bounded retries.
 `Retry-After` seconds/dates are honored, never shortened; waits exceeding the
@@ -219,11 +311,15 @@ retry budget fail explicitly. Use `-MaxRetries`, `-RetryBudgetSeconds`,
 `-RequestTimeoutSeconds`, and `-MaxPayloadMB` to bound requests. Listing/auth
 failures terminate instead of pretending there were no runs. A pipeline may
 already contain earlier results when a later collection/selected ID fails;
-catch the terminating error before treating an export as complete.
+catch that error before treating manually piped exports as complete. The direct
+`CsvPath`/`JsonPath` options do not publish their staging files on such a failure.
 
 Signed content links are fetched **without a Flow/Dataverse bearer token**.
 Only HTTPS Microsoft runtime/content hosts are accepted, redirects are disabled,
 and links/Authorization values are redacted from returned metadata and failures.
+This includes environment-scoped
+`*.environment.api.powerplatformusercontent.com` content, restricted to HTTPS
+port 443 and `/storage/powerautomate/automations/` paths.
 An unrecognized content host is blocked and reported, not automatically trusted.
 Business payloads can still contain confidential data; protect exports accordingly.
 The hidden loopback API override is solely for offline tests.
@@ -253,6 +349,10 @@ UTC/status/rolling filters, paging on flows/runs/actions/repetitions, nested act
 error/retry projections, no matches, throttling/auth/shape failures, safe record
 extraction, payload availability, and signed-link protections. Synthetic JWTs and
 an isolated Az.Accounts test double exercise tenant/audience/context selection.
+Export regressions cover fixed/minimal CSV layouts, quote/newline/Unicode
+round-trips, locale-independent durations, zero/one/many JSON arrays, simultaneous
+formats, existing/concurrently created destinations, late failures, pipeline
+interruption, redaction, and staging cleanup.
 **Fixture tests do not establish live API compatibility or cross-tenant access.**
 Live validation requires an authorized delegated user/token, an environment,
 retained run IDs, and representative Dataverse/SharePoint/loop/secured runs.
@@ -270,4 +370,5 @@ retained run IDs, and representative Dataverse/SharePoint/loop/secured runs.
 - [SharePoint connector operations and deleted-item IDs](https://learn.microsoft.com/en-us/connectors/sharepointonline/)
 - [Cloud-flow duration and retention limits](https://learn.microsoft.com/en-us/power-automate/limits-and-config#duration-and-retention-limits)
 - [Secure inputs and outputs](https://learn.microsoft.com/en-us/power-automate/how-tos-use-sensitive-input)
+- [Power Platform user-content SAS domain and IP restrictions](https://learn.microsoft.com/en-us/power-platform/admin/security/data-storage#storage-shared-access-signature-sas-ip-restriction)
 - [Dataverse flowrun storage, retention, and completeness](https://learn.microsoft.com/en-us/power-automate/dataverse/cloud-flow-run-metadata)

@@ -16,6 +16,10 @@ $itemGuid = '12121212-1212-4212-8212-121212121212'
 $originalModulePath = $env:PSModulePath
 $job = $null
 $timer = [Diagnostics.Stopwatch]::StartNew()
+$exportRoot = Join-Path ([IO.Path]::GetTempPath()) ('flow-history-exports-' + [guid]::NewGuid().ToString('N'))
+if ([IO.Directory]::Exists($exportRoot)) { throw 'The private export test directory already exists.' }
+$null = [IO.Directory]::CreateDirectory($exportRoot)
+$exportText = 'First, "quoted"' + "`r`n" + 'caf' + [char]0xE9 + ' ' + [char]0x6771 + [char]0x4EAC + ' ' + [char]::ConvertFromUtf32(0x1F680)
 
 function Assert-Equal {
     param($Actual, $Expected, [string]$Message = 'Values differ')
@@ -95,6 +99,15 @@ function New-AuthFixture {
     }
 }
 
+function Get-TestExportPath {
+    param([string]$Extension)
+    return Join-Path $exportRoot ([guid]::NewGuid().ToString('N') + '.' + $Extension)
+}
+
+function Assert-NoStagingFiles {
+    Assert-Equal @([IO.Directory]::GetFiles($exportRoot, '.flow-history-*.partial')).Count 0 'An unpublished private staging file was left behind.'
+}
+
 try {
     $portProbe = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback, 0)
     $portProbe.Start()
@@ -120,10 +133,11 @@ try {
     Invoke-Test 'Public comment-based help exposes the synopsis, switches, and complete invocation examples' {
         $help = Get-Help $scriptPath -Full
         Assert-True ([string]$help.Synopsis -match '^Reads Power Automate cloud-flow run history') 'Comment-based help was not discovered.'
-        Assert-Equal @($help.examples.example).Count 5
+        Assert-Equal @($help.examples.example).Count 6
         $examples = $help.examples.example | Out-String -Width 4096
         Assert-True ($examples -match '-Status Failed -LastDays 7 -Errors') 'The full example invocation was lost.'
         Assert-True ('CallingRecordId' -in $help.parameters.parameter.name) 'Public projection help is missing.'
+        Assert-True ('CsvPath' -in $help.parameters.parameter.name -and 'JsonPath' -in $help.parameters.parameter.name) 'Export help is missing.'
     }
 
     Invoke-Test 'Single flow summary, paged runs, no detail requests' {
@@ -258,6 +272,7 @@ try {
         Assert-Equal $loop.Detail.Inputs.Content 'fixture scalar'
         Assert-Equal $item.Trigger.Outputs.Availability 'Available'
         Assert-Equal $item.DetailCoverage 'AvailableServiceData'
+        Assert-Equal $item.FlowDisplayName "Fixture flow $flowA"
     }
     Invoke-Test 'Errors retrieves specific action/repetition/trigger/retry messages, not just the run envelope' {
         Set-Scenario 'failed-trigger'
@@ -500,6 +515,30 @@ try {
             Assert-True (($item | ConvertTo-Json -Depth 100) -notmatch 'fixture-secret') 'Signed URL leaked in error output.'
         }
     }
+    Invoke-Test 'Power Platform user-content validation is narrowly scoped to HTTPS automation storage' {
+        $tokens = $null; $parseErrors = $null
+        $ast = [Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$parseErrors)
+        $node = $ast.Find({
+            param($candidate)
+            $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and $candidate.Name -eq 'Assert-ContentUri'
+        }, $true)
+        $validator = $node.Body.GetScriptBlock()
+        $TestApiBaseUri = $null
+        $apiBase = [uri]'https://api.flow.microsoft.com'
+        $hostName = 'aaaaaaaaaaaaaaaaaaaaaaaaaa.05.environment.api.powerplatformusercontent.com'
+        & $validator ([uri]"https://$hostName/storage/powerautomate/automations/fixture/contents?sig=fixture-secret")
+        foreach ($uri in @(
+            "http://$hostName/storage/powerautomate/automations/fixture",
+            "https://${hostName}:444/storage/powerautomate/automations/fixture",
+            "https://$hostName.evil.invalid/storage/powerautomate/automations/fixture",
+            'https://environment.api.powerplatformusercontent.com/storage/powerautomate/automations/fixture',
+            "https://$hostName/elsewhere/fixture",
+            "https://$hostName/storage/powerautomate/automations/../other/fixture",
+            "https://user:password@$hostName/storage/powerautomate/automations/fixture"
+        )) {
+            Assert-Throws { & $validator ([uri]$uri) } 'Content link|content link|user-content'
+        }
+    }
     Invoke-Test 'Paging links cannot escape their origin/collection, and cycles stop immediately' {
         foreach ($scenarioName in @('evil-paging', 'cycle-paging')) {
             Set-Scenario $scenarioName
@@ -590,6 +629,236 @@ try {
             Assert-Equal @(Get-Requests).Count 0
         }
     }
+    Invoke-Test 'Export JSON preserves zero, one, and many structured results as arrays and retains pipeline objects' {
+        foreach ($count in @(0, 1, 5)) {
+            Set-Scenario
+            $path = Get-TestExportPath 'json'
+            $options = @{ FlowId = $flowA; JsonPath = $path }
+            if ($count -eq 0) { $options.Status = 'Suspended' }
+            if ($count -eq 1) { $options.RunId = 'run-failed' }
+            $items = @(Invoke-History $options)
+            Assert-Equal $items.Count $count
+            $text = [IO.File]::ReadAllText($path).Trim()
+            Assert-True ($text.StartsWith('[') -and $text.EndsWith(']')) 'JSON export is not an array.'
+            if ($count -eq 0) { Assert-Equal $text '[]' }
+            else {
+                $decoded = $text | ConvertFrom-Json
+                $decoded = @($decoded)
+                Assert-Equal $decoded.Count $count
+                Assert-Equal $decoded[0].RunId $items[0].RunId
+                Assert-Equal $items[0].FlowDisplayName "Fixture flow $flowA"
+            }
+            Assert-NoStagingFiles
+        }
+    }
+    Invoke-Test 'Export CSV uses stable headers with no matches and summary rows without extra payload requests' {
+        Set-Scenario
+        $emptyCsv = Get-TestExportPath 'csv'
+        $emptyJson = Get-TestExportPath 'json'
+        $none = @(Invoke-History @{ FlowId = $flowA; Status = 'Suspended'; CsvPath = $emptyCsv; JsonPath = $emptyJson })
+        Assert-Equal $none.Count 0
+        Assert-Equal @(Import-Csv -LiteralPath $emptyCsv -Encoding UTF8).Count 0
+        $header = [IO.File]::ReadAllText($emptyCsv).Trim()
+        Assert-True ($header.StartsWith('"RowType","EnvironmentName","FlowId","FlowDisplayName","RunId"')) 'Stable header missing.'
+        Assert-True ($header -match '"MetadataJson"') 'Lossless metadata column missing.'
+        Assert-Equal ([IO.File]::ReadAllText($emptyJson).Trim()) '[]'
+        $csv = Get-TestExportPath 'csv'
+        $items = @(Invoke-History @{ FlowId = $flowA; CsvPath = $csv })
+        $rows = @(Import-Csv -LiteralPath $csv -Encoding UTF8)
+        Assert-Equal $rows.Count 5
+        Assert-True (@($rows | Where-Object RowType -ne 'Run').Count -eq 0) 'Summary export changed output mode.'
+        Assert-Equal $rows[0].FlowDisplayName "Fixture flow $flowA"
+        Assert-Equal $items[0].RunId $rows[0].RunId
+        Assert-True (@(Get-Requests | Where-Object Path -match '/actions|/content').Count -eq 0) 'Summary exports downloaded payloads.'
+        Assert-Equal @(Get-Requests | Where-Object Path -match "/flows/$flowA$").Count 1
+        Assert-NoStagingFiles
+    }
+    Invoke-Test 'Export All CSV has run, trigger, action and repetition rows with correlations, durations and nested JSON' {
+        Set-Scenario
+        $csv = Get-TestExportPath 'csv'
+        $json = Get-TestExportPath 'json'
+        $items = @(Invoke-History @{
+            FlowId = $flowA; RunId = 'run-failed'; All = $true; CallingRecordId = $true
+            DataversePrimaryKey = @{ accounts = 'accountid' }; CsvPath = $csv; JsonPath = $json
+        })
+        Assert-Equal $items.Count 1
+        $rows = @(Import-Csv -LiteralPath $csv -Encoding UTF8)
+        Assert-Equal $rows.Count 10
+        foreach ($type in @('Run', 'Trigger', 'Action', 'ActionRepetition', 'ScopeRepetition')) {
+            Assert-True ($type -in $rows.RowType) "$type rows are missing."
+        }
+        Assert-True (@($rows | Where-Object RecordId -ne $rowId).Count -eq 0) 'Record context was lost on operation rows.'
+        $inner = @($rows | Where-Object { $_.RowType -eq 'Action' -and $_.OperationName -eq 'Inner' })[0]
+        Assert-Equal $inner.ClientTrackingId 'action-client-track'
+        Assert-Equal $inner.ActionTrackingId 'action-track-Inner'
+        Assert-Equal $inner.TrackingId 'operation-track-Inner'
+        Assert-Equal $inner.ClientRequestId 'request-Inner'
+        Assert-Equal $inner.ServiceRequestId 'service-Inner'
+        Assert-Equal $inner.DefinitionPath 'Scope/Inner'
+        Assert-Equal $inner.DurationSeconds '1.25'
+        Assert-Equal $inner.ErrorMessage 'Detailed action output: Inner'
+        Assert-Equal $inner.InputsAvailability 'Available'
+        Assert-Equal (($inner.OutputsJson | ConvertFrom-Json).body.error.message) 'Detailed action output: Inner'
+        Assert-Equal (($inner.MetadataJson | ConvertFrom-Json).properties.status) 'Failed'
+        $iteration = @($rows | Where-Object { $_.RowType -eq 'ActionRepetition' -and $_.RepetitionName -eq '000001' })[0]
+        $indexes = $iteration.RepetitionIndexesJson | ConvertFrom-Json
+        Assert-Equal @($indexes).Count 2
+        Assert-Equal $iteration.Status 'Failed'
+        Assert-Equal $iteration.DurationSeconds '0.25'
+        Assert-Equal $iteration.OperationName 'Write_Record'
+        Assert-True ([IO.File]::ReadAllText($json).Contains((ConvertTo-Json -InputObject $items[0] -Depth 100 -Compress))) 'JSON is not the full pipeline structure.'
+        Assert-NoStagingFiles
+    }
+    Invoke-Test 'Export Errors CSV retains operation details without changing pipeline projection or downloading inputs' {
+        Set-Scenario
+        $csv = Get-TestExportPath 'csv'
+        $items = @(Invoke-History @{ FlowId = $flowA; RunId = 'run-failed'; Errors = $true; CsvPath = $csv })
+        Assert-True ('Actions' -notin $items[0].PSObject.Properties.Name) 'CSV export expanded the pipeline projection.'
+        $rows = @(Import-Csv -LiteralPath $csv -Encoding UTF8)
+        Assert-Equal $rows.Count 10
+        $inner = @($rows | Where-Object { $_.RowType -eq 'Action' -and $_.OperationName -eq 'Inner' })[0]
+        Assert-Equal $inner.ErrorMessage 'Detailed action output: Inner'
+        Assert-Equal $inner.InputsAvailability 'NotRequested'
+        Assert-Equal $inner.OutputsAvailability 'Available'
+        Assert-True (@(Get-Requests | Where-Object Path -match '-input$').Count -eq 0) 'Export changed requested payload mode.'
+    }
+    Invoke-Test 'Export CSV quote/newline/Unicode cells and embedded JSON round-trip without culture loss' {
+        Set-Scenario 'export-text'
+        $csv = Get-TestExportPath 'csv'
+        $json = Get-TestExportPath 'json'
+        $culture = [Threading.Thread]::CurrentThread.CurrentCulture
+        try {
+            [Threading.Thread]::CurrentThread.CurrentCulture = [Globalization.CultureInfo]::GetCultureInfo('de-DE')
+            $items = @(Invoke-History @{ FlowId = $flowA; RunId = 'run-failed'; All = $true; CsvPath = $csv; JsonPath = $json })
+        }
+        finally { [Threading.Thread]::CurrentThread.CurrentCulture = $culture }
+        $rows = @(Import-Csv -LiteralPath $csv -Encoding UTF8)
+        $run = @($rows | Where-Object RowType -eq 'Run')[0]
+        Assert-Equal $run.ErrorMessage $exportText
+        Assert-Equal $run.FlowDisplayName $exportText
+        Assert-Equal $run.RunDurationSeconds '1.25'
+        Assert-Equal (($run.MetadataJson | ConvertFrom-Json).properties.error.message) $exportText
+        Assert-Equal $items[0].FlowDisplayName $exportText
+        $decoded = @([IO.File]::ReadAllText($json) | ConvertFrom-Json)
+        Assert-Equal $decoded[0].FlowDisplayName $exportText
+        Assert-Equal ([IO.File]::ReadAllBytes($csv)[0..2] -join ',') '239,187,191' 'CSV must have a consistent UTF-8 BOM.'
+        Assert-NoStagingFiles
+    }
+    Invoke-Test 'Export IdOnly CSV is genuinely one column and JSON is an array of ID strings, including no matches' {
+        foreach ($excluded in @($false, $true)) {
+            Set-Scenario
+            $csv = Get-TestExportPath 'csv'
+            $json = Get-TestExportPath 'json'
+            $options = @{
+                FlowId = $flowB; RunId = 'b-failed'; CallingRecordId = $true; IdOnly = $true
+                CsvPath = $csv; JsonPath = $json
+            }
+            if ($excluded) { $options.RecordSource = 'Dataverse' }
+            $items = @(Invoke-History $options)
+            $text = [IO.File]::ReadAllText($csv)
+            Assert-Equal ($text -split '\r?\n')[0] '"RecordId"'
+            $rows = @(Import-Csv -LiteralPath $csv -Encoding UTF8)
+            if ($excluded) {
+                Assert-Equal $rows.Count 0
+                Assert-Equal ([IO.File]::ReadAllText($json).Trim()) '[]'
+            }
+            else {
+                Assert-Equal $items[0] '42'
+                Assert-Equal $rows.Count 1
+                Assert-Equal $rows[0].RecordId '42'
+                Assert-Equal @($rows[0].PSObject.Properties.Name).Count 1
+                Assert-Equal (@([IO.File]::ReadAllText($json) | ConvertFrom-Json)[0]) '42'
+            }
+            Assert-NoStagingFiles
+        }
+    }
+    Invoke-Test 'Export CallingRecordId projection keeps identity/context without persisting trigger payloads' {
+        Set-Scenario
+        $csv = Get-TestExportPath 'csv'
+        $json = Get-TestExportPath 'json'
+        $items = @(Invoke-History @{
+            FlowId = $flowB; RunId = 'b-failed'; CallingRecordId = $true; CsvPath = $csv; JsonPath = $json
+        })
+        $rows = @(Import-Csv -LiteralPath $csv -Encoding UTF8)
+        Assert-Equal $rows.Count 1
+        Assert-Equal $rows[0].RecordId '42'
+        Assert-Equal $rows[0].SiteUrl 'https://contoso.sharepoint.com/sites/fixture'
+        Assert-Equal $rows[0].FlowDisplayName "Fixture flow $flowB"
+        Assert-Equal $rows[0].InputsJson ''
+        Assert-Equal $rows[0].OutputsJson ''
+        Assert-Equal $rows[0].MetadataJson ''
+        Assert-True ([IO.File]::ReadAllText($json) -notmatch 'fixture payload|folder/file.txt') 'Record-only JSON retained trigger business data.'
+        Assert-Equal $items[0].CallingRecord.RecordId '42'
+    }
+    Invoke-Test 'Export files preserve explicit partial coverage and redact signed links and bearer values' {
+        foreach ($scenarioName in @('normal', 'secured', 'repetitions-unsupported')) {
+            Set-Scenario $scenarioName
+            $csv = Get-TestExportPath 'csv'
+            $json = Get-TestExportPath 'json'
+            $null = Invoke-History @{ FlowId = $flowA; RunId = 'run-failed'; All = $true; CsvPath = $csv; JsonPath = $json }
+            $rows = @(Import-Csv -LiteralPath $csv -Encoding UTF8)
+            if ($scenarioName -ne 'normal') {
+                Assert-True (@($rows | Where-Object DetailCoverage -ne 'Partial').Count -eq 0) 'Partial data looked complete in CSV.'
+                Assert-True (($rows[0].IssuesJson | ConvertFrom-Json).Count -gt 0) 'CSV issues were omitted.'
+            }
+            foreach ($path in @($csv, $json)) {
+                Assert-True ([IO.File]::ReadAllText($path) -notmatch 'fixture-secret|fixture-sensitive-value|fixture-not-a-real-credential') 'An export leaked a bearer secret.'
+            }
+            Assert-NoStagingFiles
+        }
+    }
+    Invoke-Test 'Export late auth/paging failures and missing selected runs publish no final files or staging debris' {
+        foreach ($scenarioName in @('late-auth', 'late-paging', 'missing-run')) {
+            Set-Scenario $scenarioName
+            $csv = Get-TestExportPath 'csv'
+            $json = Get-TestExportPath 'json'
+            $options = @{ FlowId = @($flowA, $flowB); CsvPath = $csv; JsonPath = $json }
+            if ($scenarioName -eq 'missing-run') { $options.RunId = @('run-failed', 'not-retained') }
+            Assert-Throws { Invoke-History $options } 'HTTP 401|paging link|not found'
+            Assert-True (-not [IO.File]::Exists($csv) -and -not [IO.File]::Exists($json)) 'An incomplete traversal published apparently complete exports.'
+            Assert-NoStagingFiles
+        }
+    }
+    Invoke-Test 'Export existing/invalid/identical destinations are rejected before HTTP without overwriting anything' {
+        Set-Scenario
+        $existing = Get-TestExportPath 'json'
+        [IO.File]::WriteAllText($existing, 'keep this existing content')
+        $newCsv = Get-TestExportPath 'csv'
+        Assert-Throws { Invoke-History @{ FlowId = $flowA; CsvPath = $newCsv; JsonPath = $existing } } 'already exists'
+        Assert-Equal ([IO.File]::ReadAllText($existing)) 'keep this existing content'
+        Assert-True (-not [IO.File]::Exists($newCsv)) 'Another export was published despite failed preflight.'
+        $same = Get-TestExportPath 'json'
+        Assert-Throws { Invoke-History @{ FlowId = $flowA; CsvPath = $same; JsonPath = $same } } 'different files'
+        $missingParent = Join-Path (Join-Path $exportRoot 'does-not-exist') 'file.csv'
+        foreach ($options in @(@{ CsvPath = '' }, @{ JsonPath = '' }, @{ CsvPath = $missingParent }, @{ JsonPath = $exportRoot })) {
+            Assert-Throws { Invoke-History $options } 'empty|already exist|must already exist'
+        }
+        Assert-Equal @(Get-Requests).Count 0
+        Assert-NoStagingFiles
+    }
+    Invoke-Test 'Export destinations created concurrently are preserved and both staged outputs are discarded' {
+        Set-Scenario
+        $csv = Get-TestExportPath 'csv'
+        $json = Get-TestExportPath 'json'
+        $arguments = @{} + $defaults + @{ FlowId = $flowA; CsvPath = $csv; JsonPath = $json }
+        Assert-Throws {
+            & $scriptPath @arguments | ForEach-Object {
+                if (-not [IO.File]::Exists($json)) { [IO.File]::WriteAllText($json, 'concurrent writer content') }
+            }
+        } 'destination appeared'
+        Assert-Equal ([IO.File]::ReadAllText($json)) 'concurrent writer content'
+        Assert-True (-not [IO.File]::Exists($csv)) 'A sibling export published after the destination race was detected.'
+        Assert-NoStagingFiles
+    }
+    Invoke-Test 'Export interrupted by a downstream pipeline consumer is not published' {
+        Set-Scenario
+        $csv = Get-TestExportPath 'csv'
+        $json = Get-TestExportPath 'json'
+        $arguments = @{} + $defaults + @{ FlowId = $flowA; CsvPath = $csv; JsonPath = $json }
+        $null = & $scriptPath @arguments | Select-Object -First 1
+        Assert-True (-not [IO.File]::Exists($csv) -and -not [IO.File]::Exists($json)) 'A stopped pipeline published incomplete exports.'
+        Assert-NoStagingFiles
+    }
     $env:PSModulePath = (Join-Path $PSScriptRoot 'fixtures') + [IO.Path]::PathSeparator + $originalModulePath
     Invoke-Test 'Interactive Az sign-in explicitly selects target tenant and commercial cloud' {
         Set-Scenario
@@ -646,6 +915,7 @@ finally {
         if ($job.State -eq 'Running') { Stop-Job $job }
         Remove-Job $job -Force
     }
+    [IO.Directory]::Delete($exportRoot, $true)
 }
 
 $failed = @($results | Where-Object { -not $_.Passed })

@@ -18,6 +18,7 @@ $rowId = '12345678-1234-4234-8234-123456789abc'
 $lookupId = '99999999-9999-4999-8999-999999999999'
 $itemGuid = '12121212-1212-4212-8212-121212121212'
 $root = '/providers/Microsoft.ProcessSimple/environments/test-environment'
+$exportText = 'First, "quoted"' + "`r`n" + 'caf' + [char]0xE9 + ' ' + [char]0x6771 + [char]0x4EAC + ' ' + [char]::ConvertFromUtf32(0x1F680)
 
 function Send-Response {
     param($Context, $Body, [int]$Code = 200, [hashtable]$Headers = @{}, [switch]$Raw,
@@ -46,6 +47,9 @@ function New-Trigger {
     $trigger = @{
         name = 'When_row_changes'; status = 'Succeeded'
         inputsLink = New-Link "$kind-input"; outputsLink = New-Link "$kind-output"
+        startTime = '2026-11-07T12:00:00Z'; endTime = '2026-11-07T12:00:00.5000000Z'
+        correlation = @{ clientTrackingId = 'trigger-client-track'; actionTrackingId = 'trigger-action-track' }
+        trackingId = 'trigger-track'
     }
     if ($kind -eq 'sp') { $trigger.name = 'When_item_changes' }
     if ($kind -eq 'recurrence') { $trigger.name = 'Recurrence'; $trigger.Remove('inputsLink'); $trigger.Remove('outputsLink') }
@@ -64,6 +68,9 @@ function New-Action {
     $properties = @{
         status = 'Succeeded'; code = 'OK'
         inputsLink = New-Link "action-$Name-input"; outputsLink = New-Link "action-$Name-output"
+        startTime = '2026-11-07T12:00:00Z'; endTime = '2026-11-07T12:00:01.2500000Z'
+        correlation = @{ clientTrackingId = 'action-client-track'; actionTrackingId = "action-track-$Name" }
+        trackingId = "operation-track-$Name"; clientRequestId = "request-$Name"; serviceRequestId = "service-$Name"
     }
     if ($Name -in @('Scope', 'Inner', 'Write_Record')) {
         $properties.status = 'Failed'
@@ -102,6 +109,12 @@ function New-Run {
     $properties = @{
         startTime = $time; endTime = $time; status = $status; code = $code
         trigger = New-Trigger $Flow
+        correlation = @{ clientTrackingId = "run-track-$Name"; clientKeywords = @('fixture') }
+        trackingId = "run-operation-$Name"
+    }
+    if ($scenario -eq 'export-text') {
+        $properties.error = @{ code = 'ExportFixtureError'; message = $exportText }
+        $properties.endTime = ([DateTimeOffset]::Parse($time).AddSeconds(1.25)).ToString('o')
     }
     if ($Expanded) {
         $properties.actions = @{}
@@ -154,7 +167,8 @@ function New-Flow {
     return @{
         name = $Id
         properties = @{
-            displayName = "Fixture flow $Id"; isSolutionAware = ($Id -eq $flowC)
+            displayName = $(if ($scenario -eq 'export-text') { $exportText } else { "Fixture flow $Id" })
+            isSolutionAware = ($Id -eq $flowC)
             connectionReferences = @{ fixture = @{ id = "/providers/Microsoft.PowerApps/apis/$api" } }
             definition = @{
                 triggers = @{ $triggerName = @{ type = 'OpenApiConnectionWebhook'; inputs = @{ host = $hostInfo } } }
@@ -287,6 +301,10 @@ try {
                 Send-Response $context @{ body = $body }; continue
             }
             if ($name -match '^action-(.+)-output$') {
+                if ($scenario -eq 'export-text') {
+                    Send-Response $context @{ body = @{ error = @{ code = 'ExportActionError'; message = $exportText } } }
+                    continue
+                }
                 if ($scenario -eq 'structured-message') {
                     Send-Response $context @{
                         body = @{ error = @{ code = 'ConnectorError'; message = @{ lang = 'en-US'; value = 'Structured connector message' } } }
@@ -326,6 +344,10 @@ try {
             continue
         }
         if ($path -match '/runs$') {
+            if ($scenario -eq 'late-auth' -and $path -match "/flows/$flowB/runs$") {
+                Send-Response $context @{ error = 'Late authorization failure' } 401
+                continue
+            }
             if ($scenario -in @('throttled', 'retry-date', 'server-error', 'retry-budget', 'always-throttled')) {
                 if ($attempts[$path] -eq 1 -or $scenario -in @('always-throttled', 'retry-budget')) {
                     $headers = @{ 'Retry-After' = '0' }
@@ -358,6 +380,13 @@ try {
         }
         if ($path -match '/flows/([^/]+)/runs$') {
             $flow = $Matches[1]
+            if ($scenario -eq 'late-paging' -and $flow -eq $flowB) {
+                Send-Response $context @{
+                    value = @((New-Run $flowB 'b-failed'))
+                    nextLink = 'https://example.invalid/another-collection?sig=fixture-secret'
+                }
+                continue
+            }
             $items = @(Get-RunNames $flow | ForEach-Object { New-Run $flow $_ })
             Send-Page $context $items
             continue
@@ -396,6 +425,8 @@ try {
                             repetitionIndexes = @(@{ scopeName = 'Outer'; itemIndex = 0 }, @{ scopeName = 'Loop'; itemIndex = $i })
                             inputsLink = New-Link "repetition-$repetitionName-input"
                             outputsLink = New-Link "repetition-$repetitionName-output"
+                            startTime = '2026-11-07T12:00:00Z'; endTime = '2026-11-07T12:00:00.2500000Z'
+                            correlation = @{ clientTrackingId = 'iteration-client-track'; actionTrackingId = "iteration-track-$repetitionName" }
                         }
                     }
                 }

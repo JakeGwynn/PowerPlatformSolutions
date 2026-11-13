@@ -14,6 +14,9 @@ Omitting FlowId discovers visible personal, shared, and solution cloud flows.
 AsAdmin uses administrator discovery/history, not an ownership bypass.
 Dates filter run START times, inclusively From and exclusively To, in UTC.
 This uses the Power Automate service, not the Dataverse flowrun table.
+CsvPath and JsonPath export the selected output mode without replacing pipeline
+objects. Files are staged until retrieval finishes, and existing files are never
+overwritten. Use All for full structured JSON and operation-level CSV rows.
 See README.md for permissions, retention, and completeness limitations.
 
 .PARAMETER TenantId
@@ -101,6 +104,16 @@ Per-attempt timeout, including reading the body (default 120).
 Maximum buffered response size, including payloads (default 64 MiB).
 Oversize/unreadable payloads are reported as unavailable, not truncated.
 
+.PARAMETER CsvPath
+New CSV file in an existing directory. Uses run/trigger/action/repetition rows
+with compact JSON cells for nested data. With IdOnly, contains just RecordId.
+No matches creates a header-only CSV. Pipeline objects are still returned.
+
+.PARAMETER JsonPath
+New UTF-8 JSON file in an existing directory. Always a structured JSON array,
+including [] for no matches and ["id"] for IdOnly. May be combined with CsvPath.
+No final export is published if retrieval terminates with an error.
+
 .EXAMPLE
 .\Get-FlowRunHistory.ps1 -TenantId '11111111-1111-4111-8111-111111111111' -EnvironmentName 'Default-11111111-1111-4111-8111-111111111111' -FlowId '22222222-2222-4222-8222-222222222222' -Status Failed -LastDays 7 -Errors
 
@@ -116,6 +129,9 @@ $flows = '22222222-2222-4222-8222-222222222222', '33333333-3333-4333-8333-333333
 
 .EXAMPLE
 .\Get-FlowRunHistory.ps1 -TenantId $tenant -EnvironmentName $environment -FlowId $flow -CallingRecordId -IdOnly -DataversePrimaryKey @{ accounts = 'accountid' }
+
+.EXAMPLE
+.\Get-FlowRunHistory.ps1 -TenantId $tenant -EnvironmentName $environment -FlowId $flows -Status Failed -LastDays 7 -All -CsvPath '.\failed-runs.csv' -JsonPath '.\failed-runs.json'
 
 .NOTES
 Windows PowerShell 5.1 / PowerShell 7. Commercial cloud only.
@@ -149,6 +165,8 @@ param(
     [ValidateRange(1, 86400)][int]$RetryBudgetSeconds = 180,
     [ValidateRange(1, 600)][int]$RequestTimeoutSeconds = 120,
     [ValidateRange(1, 1024)][int]$MaxPayloadMB = 64,
+    [string]$CsvPath,
+    [string]$JsonPath,
     [Parameter(DontShow)][uri]$TestApiBaseUri
 )
 
@@ -164,6 +182,23 @@ $metadataCache = @{}
 $definitionCache = @{}
 $http = $null
 $handler = $null
+$exportFiles = [System.Collections.Generic.List[object]]::new()
+$exportResultCount = 0
+$csvParameters = @{ Delimiter = ',' }
+if ($PSVersionTable.PSVersion.Major -lt 6) { $csvParameters.NoTypeInformation = $true }
+$csvColumns = @(
+    'RowType', 'EnvironmentName', 'FlowId', 'FlowDisplayName', 'RunId', 'RunStatus',
+    'RunStartTimeUtc', 'RunEndTimeUtc', 'RunDurationSeconds', 'OperationName', 'DefinitionPath',
+    'RepetitionName', 'OperationId', 'Status', 'Code', 'StartTimeUtc', 'EndTimeUtc', 'DurationSeconds',
+    'ClientTrackingId', 'TrackingId', 'ActionTrackingId', 'ClientRequestId', 'ServiceRequestId',
+    'RepetitionIndexesJson', 'InputsAvailability', 'OutputsAvailability', 'InputsReason', 'OutputsReason',
+    'InputsJson', 'OutputsJson', 'RepetitionsAvailability', 'ScopeRepetitionsAvailability',
+    'ErrorCode', 'ErrorMessage', 'ErrorsJson', 'DetailCoverage', 'IssuesJson',
+    'RecordSource', 'RecordId', 'RecordAvailability', 'Table', 'PrimaryKey', 'SiteUrl', 'ListId',
+    'ItemId', 'UniqueId', 'RecordEvidence', 'ConnectorEvidence', 'TriggerOperation', 'RecordReason',
+    'CallingRecordJson', 'RunCorrelationJson', 'CorrelationJson', 'RetryHistoryJson', 'MetadataJson',
+    'DefinitionEvidence'
+)
 
 function Get-Field {
     param($Object, [string]$Name)
@@ -367,6 +402,13 @@ function Assert-ContentUri {
         $Uri.Scheme -eq $apiBase.Scheme -and $Uri.Authority -eq $apiBase.Authority) { return }
     if ($Uri.Scheme -ne 'https' -or $Uri.Port -ne 443 -or $Uri.IsLoopback) {
         throw 'Content link must use HTTPS on a supported Microsoft content host.'
+    }
+    $userContentSuffix = '.environment.api.powerplatformusercontent.com'
+    if ($Uri.DnsSafeHost.EndsWith($userContentSuffix, [StringComparison]::OrdinalIgnoreCase)) {
+        $prefix = $Uri.DnsSafeHost.Substring(0, $Uri.DnsSafeHost.Length - $userContentSuffix.Length)
+        if ($prefix -match '^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$' -and
+            $Uri.AbsolutePath.StartsWith('/storage/powerautomate/automations/', [StringComparison]::Ordinal)) { return }
+        throw 'Power Platform user-content link is outside the supported automation storage namespace.'
     }
     foreach ($suffix in @('logic.azure.com', 'api.powerplatform.com', 'flow.microsoft.com', 'blob.core.windows.net')) {
         if ($Uri.DnsSafeHost -eq $suffix -or $Uri.DnsSafeHost.EndsWith('.' + $suffix, [StringComparison]::OrdinalIgnoreCase)) { return }
@@ -977,8 +1019,244 @@ function Test-RunSelection {
     return $true
 }
 
-function Convert-RunResult {
+function ConvertTo-ExportJson {
+    param($Value)
+    return ConvertTo-Json -InputObject (Protect-Data $Value) -Depth 100 -Compress
+}
+
+function Get-ExportTime {
+    param($Properties, [string]$Name)
+    $value = Get-Field $Properties $Name
+    if ($value) { return (ConvertTo-UtcDate $value "Service $Name").ToString('o') }
+    return $null
+}
+
+function Get-ExportDuration {
+    param($Properties)
+    $start = Get-Field $Properties 'startTime'
+    $end = Get-Field $Properties 'endTime'
+    if ($start -and $end) {
+        $seconds = ((ConvertTo-UtcDate $end 'Service endTime') - (ConvertTo-UtcDate $start 'Service startTime')).TotalSeconds
+        return $seconds.ToString('0.#######', [Globalization.CultureInfo]::InvariantCulture)
+    }
+    return $null
+}
+
+function New-CsvRow {
+    $row = [ordered]@{}
+    if ($IdOnly) { $row['RecordId'] = $null }
+    else { foreach ($column in $csvColumns) { $row[$column] = $null } }
+    return $row
+}
+
+function ConvertTo-CsvOperationRow {
+    param($Result, $Context, [string]$RowType, $Detail, [string]$DefinitionPath = '',
+        [string]$ActionName = '', $Action = $null)
+    $row = New-CsvRow
+    $runProperties = Get-Field $Context.Run 'properties'
+    $operation = $Context.Run
+    if ($null -ne $Detail) { $operation = $Detail.Metadata }
+    $properties = Get-OperationProperties $operation
+    $correlation = Get-Field $properties 'correlation'
+    $runCorrelation = Get-Field $runProperties 'correlation'
+    $row.RowType = $RowType
+    foreach ($field in @('EnvironmentName', 'FlowId', 'RunId')) { $row[$field] = Get-Field $Result $field }
+    $row.FlowDisplayName = $Context.FlowDisplayName
+    $row.RunStatus = Get-Field $runProperties 'status'
+    $row.RunStartTimeUtc = Get-ExportTime $runProperties 'startTime'
+    $row.RunEndTimeUtc = Get-ExportTime $runProperties 'endTime'
+    $row.RunDurationSeconds = Get-ExportDuration $runProperties
+    $row.OperationName = $row.RunId
+    if ($null -ne $Detail) { $row.OperationName = $Detail.Name }
+    if ($ActionName) {
+        $row.OperationName = $ActionName
+        $row.RepetitionName = $Detail.Name.Substring($ActionName.Length + 1)
+    }
+    $row.DefinitionPath = $DefinitionPath
+    $row.OperationId = Get-Field $operation 'id'
+    $row.Status = Get-Field $properties 'status'
+    $row.Code = Get-Field $properties 'code'
+    $row.StartTimeUtc = Get-ExportTime $properties 'startTime'
+    $row.EndTimeUtc = Get-ExportTime $properties 'endTime'
+    $row.DurationSeconds = Get-ExportDuration $properties
+    $row.ClientTrackingId = Get-Field $correlation 'clientTrackingId'
+    if (-not $row.ClientTrackingId) { $row.ClientTrackingId = Get-Field $runCorrelation 'clientTrackingId' }
+    $row.TrackingId = Get-Field $properties 'trackingId'
+    $row.ActionTrackingId = Get-Field $correlation 'actionTrackingId'
+    foreach ($field in @('ClientRequestId', 'ServiceRequestId')) {
+        $row[$field] = Get-Field $properties $field
+        if (-not $row[$field]) { $row[$field] = Get-Field $correlation $field }
+    }
+    $row.RepetitionIndexesJson = ConvertTo-ExportJson (Get-Field $properties 'repetitionIndexes')
+    foreach ($side in @('Inputs', 'Outputs')) {
+        $payload = Get-Field $Detail $side
+        $row[$side + 'Availability'] = 'NotRequested'
+        if ($null -ne $payload) {
+            $row[$side + 'Availability'] = $payload.Availability
+            $row[$side + 'Reason'] = $payload.Reason
+            if ($payload.Availability -eq 'Available') { $row[$side + 'Json'] = ConvertTo-ExportJson $payload.Content }
+        }
+    }
+    if ($null -ne $Action) {
+        $row.RepetitionsAvailability = $Action.Repetitions.Availability
+        $row.ScopeRepetitionsAvailability = $Action.ScopeRepetitions.Availability
+    }
+    $operationError = Get-Field $properties 'error'
+    $row.ErrorCode = Get-Field $operationError 'code'
+    $row.ErrorMessage = Get-ErrorMessage (Get-Field $operationError 'message')
+    $allErrors = Get-Field $Result 'Errors'
+    $relatedErrors = @(
+        foreach ($entry in $allErrors) {
+            if ($RowType -eq 'Run' -or
+                ($entry.Name -eq $Detail.Name -and $entry.Source.StartsWith($RowType, [StringComparison]::Ordinal))) { $entry }
+        }
+    )
+    if ($RowType -ne 'Run') {
+        $messages = @($relatedErrors | Where-Object { $_.Source -eq ($RowType + 'Output') -and $_.Message })
+        if ($messages.Count -eq 0) { $messages = @($relatedErrors | Where-Object { $_.Message }) }
+        if ($messages.Count -gt 0) {
+            $row.ErrorCode = $messages[0].Code
+            $row.ErrorMessage = $messages[0].Message
+        }
+    }
+    $row.ErrorsJson = ConvertTo-ExportJson $relatedErrors
+    $row.DetailCoverage = Get-Field $Result 'DetailCoverage'
+    if (-not $row.DetailCoverage) { $row.DetailCoverage = 'SummaryOnly' }
+    $row.IssuesJson = ConvertTo-ExportJson (Get-Field $Result 'Issues')
+    $record = Get-Field $Result 'CallingRecord'
+    foreach ($field in @('RecordId', 'Table', 'PrimaryKey', 'SiteUrl', 'ListId', 'ItemId', 'UniqueId',
+            'ConnectorEvidence', 'TriggerOperation')) { $row[$field] = Get-Field $record $field }
+    $row.RecordSource = Get-Field $record 'Source'
+    $row.RecordAvailability = Get-Field $record 'Availability'
+    $row.RecordEvidence = Get-Field $record 'Evidence'
+    $row.RecordReason = Get-Field $record 'Reason'
+    $row.CallingRecordJson = ConvertTo-ExportJson $record
+    $row.RunCorrelationJson = ConvertTo-ExportJson $runCorrelation
+    $row.CorrelationJson = ConvertTo-ExportJson $correlation
+    $row.RetryHistoryJson = ConvertTo-ExportJson (Get-Field $properties 'retryHistory')
+    $row.MetadataJson = ConvertTo-ExportJson $operation
+    $row.DefinitionEvidence = Get-Field $Result 'DefinitionEvidence'
+    return Protect-Data ([pscustomobject]$row)
+}
+
+function ConvertTo-CsvRows {
+    param($Result, $Context)
+    if ($IdOnly) { return [pscustomobject]@{ RecordId = [string]$Result } }
+    if ($CallingRecordId -and -not ($All -or $Errors)) {
+        $row = ConvertTo-CsvOperationRow $Result $Context 'Run' $null
+        foreach ($field in @('MetadataJson', 'ErrorsJson', 'ErrorCode', 'ErrorMessage', 'RetryHistoryJson')) { $row.$field = $null }
+        return $row
+    }
+    ConvertTo-CsvOperationRow $Result $Context 'Run' $null
+    if ($null -ne $Context.Trigger) {
+        ConvertTo-CsvOperationRow $Result $Context 'Trigger' $Context.Trigger
+    }
+    foreach ($action in $Context.Actions) {
+        ConvertTo-CsvOperationRow $Result $Context 'Action' $action.Detail $action.DefinitionPath '' $action
+        foreach ($kind in @('Repetitions', 'ScopeRepetitions')) {
+            $type = 'ActionRepetition'
+            if ($kind -eq 'ScopeRepetitions') { $type = 'ScopeRepetition' }
+            foreach ($repetition in $action.$kind.Items) {
+                ConvertTo-CsvOperationRow $Result $Context $type $repetition $action.DefinitionPath $action.Name
+            }
+        }
+    }
+}
+
+function Add-ExportPath {
+    param([string]$Path, [string]$Kind)
+    if ([string]::IsNullOrWhiteSpace($Path)) { throw "$Kind export path cannot be empty." }
+    $provider = $null; $drive = $null
+    $resolved = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path, [ref]$provider, [ref]$drive)
+    if ($provider.Name -ne 'FileSystem') { throw "$Kind export path must use the FileSystem provider." }
+    $resolved = [IO.Path]::GetFullPath($resolved)
+    if (-not [IO.Directory]::Exists([IO.Path]::GetDirectoryName($resolved))) {
+        throw "$Kind export parent directory must already exist."
+    }
+    if ([IO.File]::Exists($resolved) -or [IO.Directory]::Exists($resolved)) {
+        throw "$Kind export destination already exists; choose a new file. Nothing will be overwritten."
+    }
+    $comparison = [StringComparison]::Ordinal
+    if ([IO.Path]::DirectorySeparatorChar -eq '\') { $comparison = [StringComparison]::OrdinalIgnoreCase }
+    foreach ($entry in $exportFiles) {
+        if ([string]::Equals($resolved, $entry.Path, $comparison)) { throw 'CsvPath and JsonPath must name different files.' }
+    }
+    $exportFiles.Add([pscustomobject]@{
+        Kind = $Kind; Path = $resolved; TemporaryPath = $null
+        Created = $false; Stream = $null; Writer = $null; Published = $false
+    })
+}
+
+function Initialize-ExportFiles {
+    foreach ($entry in $exportFiles) {
+        $entry.TemporaryPath = Join-Path ([IO.Path]::GetDirectoryName($entry.Path)) ('.flow-history-' + [guid]::NewGuid().ToString('N') + '.partial')
+        $entry.Stream = [IO.File]::Open($entry.TemporaryPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $entry.Created = $true
+        $encoding = [Text.UTF8Encoding]::new(($entry.Kind -eq 'CSV'))
+        $entry.Writer = [IO.StreamWriter]::new($entry.Stream, $encoding)
+        if ($entry.Kind -eq 'JSON') { $entry.Writer.Write('[') }
+        else {
+            $header = @([pscustomobject](New-CsvRow) | ConvertTo-Csv @csvParameters)[0]
+            $entry.Writer.WriteLine($header)
+        }
+    }
+}
+
+function Complete-ExportFiles {
+    foreach ($entry in $exportFiles) {
+        if ($entry.Kind -eq 'JSON') {
+            if ($exportResultCount -gt 0) { $entry.Writer.WriteLine() }
+            $entry.Writer.WriteLine(']')
+        }
+        $entry.Writer.Dispose()
+        $entry.Writer = $null
+        $entry.Stream = $null
+    }
+    foreach ($entry in $exportFiles) {
+        if ([IO.File]::Exists($entry.Path) -or [IO.Directory]::Exists($entry.Path)) {
+            throw 'An export destination appeared during retrieval. Existing files were preserved and no staged export was published.'
+        }
+    }
+    try {
+        foreach ($entry in $exportFiles) {
+            [IO.File]::Move($entry.TemporaryPath, $entry.Path)
+            $entry.Published = $true
+        }
+    }
+    catch {
+        $published = @($exportFiles | Where-Object Published | Select-Object -ExpandProperty Path)
+        $message = 'Export publication failed; existing destinations were not overwritten.'
+        if ($published.Count -gt 0) {
+            $message += ' These files were already published with complete results: ' + ($published -join ', ') + '.'
+        }
+        throw [IO.IOException]::new($message, $_.Exception)
+    }
+}
+
+function Write-RunResult {
     param($Run, $Flow, [bool]$AlreadyDetailed)
+    $context = @{ Run = $null; Trigger = $null; Actions = @(); FlowDisplayName = $null }
+    foreach ($result in @(Convert-RunResult $Run $Flow $AlreadyDetailed $context)) {
+        foreach ($entry in $exportFiles) {
+            if ($entry.Kind -eq 'JSON') {
+                if ($exportResultCount -gt 0) { $entry.Writer.WriteLine(',') }
+                else { $entry.Writer.WriteLine() }
+                $entry.Writer.Write((ConvertTo-ExportJson $result))
+            }
+            else {
+                foreach ($row in (ConvertTo-CsvRows $result $context)) {
+                    $record = @(ConvertTo-Csv -InputObject $row @csvParameters)[1]
+                    $entry.Writer.WriteLine($record)
+                }
+            }
+        }
+        $script:exportResultCount++
+        $result
+    }
+}
+
+function Convert-RunResult {
+    param($Run, $Flow, [bool]$AlreadyDetailed, [hashtable]$ExportContext)
     $id = [string](Get-Field $Flow 'name')
     $runName = [string](Get-Field $Run 'name')
     if (-not $runName) { throw 'A run did not contain its run name.' }
@@ -995,6 +1273,7 @@ function Convert-RunResult {
         }
     }
     $properties = Get-Field $Run 'properties'
+    $ExportContext.Run = $Run
     $result = [ordered]@{
         EnvironmentName = $EnvironmentName; FlowId = $id
         FlowDisplayName = (Get-Field (Get-Field $Flow 'properties') 'displayName')
@@ -1005,17 +1284,32 @@ function Convert-RunResult {
         $timeValue = Get-Field $properties $timeField
         if ($timeValue) { $result[$timeField] = (ConvertTo-UtcDate $timeValue "Service $timeField").ToString('o') }
     }
-    if (-not ($All -or $Errors -or $CallingRecordId)) { return [pscustomobject]$result }
+    if (-not ($All -or $Errors -or $CallingRecordId)) {
+        if (($CsvPath -or $JsonPath) -and -not $result.FlowDisplayName) {
+            $flowMetadata = Get-FlowDefinition $id
+            $result.FlowDisplayName = Get-Field (Get-Field $flowMetadata.Flow 'properties') 'displayName'
+            if ($flowMetadata.Availability -ne 'Available') {
+                Write-Warning "Flow display name unavailable for $id; export retains its FlowId. $($flowMetadata.Reason)"
+            }
+        }
+        $ExportContext.FlowDisplayName = $result.FlowDisplayName
+        return [pscustomobject]$result
+    }
     $definition = Get-FlowDefinition $id
+    $knownDisplayName = Get-Field (Get-Field $definition.Flow 'properties') 'displayName'
+    if ($knownDisplayName) { $result.FlowDisplayName = $knownDisplayName }
+    $ExportContext.FlowDisplayName = $result.FlowDisplayName
     if ($definition.Availability -ne 'Available') {
         Add-Issue $issues 'FlowDefinition' $definition.Availability $definition.Reason
     }
     $trigger = Get-Field $properties 'trigger'
     $triggerName = [string](Get-Field $trigger 'name')
     $triggerDetail = Get-OperationDetail $trigger $triggerName 'Trigger' $issues $errorList
+    $ExportContext.Trigger = $triggerDetail
     if ($All -or $Errors) {
         Add-OperationErrors $errorList $properties 'Run' $runName $null $null
         $actions = @(Get-RunActions $Run $runUri $definition $issues $errorList)
+        $ExportContext.Actions = $actions
         if ($All) {
             $result.Run = $Run
             $result.Trigger = $triggerDetail
@@ -1103,9 +1397,12 @@ try {
         }
         $apiBase = $TestApiBaseUri
     }
+    if ($supplied.ContainsKey('CsvPath')) { Add-ExportPath $CsvPath 'CSV' }
+    if ($supplied.ContainsKey('JsonPath')) { Add-ExportPath $JsonPath 'JSON' }
     if ($null -eq $AccessToken) { Initialize-AzContext }
     $null = Get-ServiceToken 'Flow'
     if ($null -ne $DataverseAccessToken) { $null = Get-ServiceToken 'Dataverse' }
+    Initialize-ExportFiles
     Add-Type -AssemblyName System.Net.Http
     $handler = [System.Net.Http.HttpClientHandler]::new()
     $handler.AllowAutoRedirect = $false
@@ -1166,7 +1463,7 @@ try {
                     throw
                 }
                 $foundRuns[$runName] = $true
-                if (Test-RunSelection $run) { Convert-RunResult $run $flow $true }
+                if (Test-RunSelection $run) { Write-RunResult $run $flow $true }
             }
         }
         else {
@@ -1183,7 +1480,7 @@ try {
                     if ($runName -notin $runIds) { continue }
                     $foundRuns[$runName] = $true
                 }
-                if (Test-RunSelection $run) { Convert-RunResult $run $flow $false }
+                if (Test-RunSelection $run) { Write-RunResult $run $flow $false }
             }
         }
     }
@@ -1191,8 +1488,19 @@ try {
     if ($missing.Count -gt 0) {
         throw "Selected run IDs were not found in the selected/visible flows (possibly deleted or outside retention): $($missing -join ', ')."
     }
+    Complete-ExportFiles
 }
 finally {
     if ($null -ne $http) { $http.Dispose() }
     elseif ($null -ne $handler) { $handler.Dispose() }
+    foreach ($entry in $exportFiles) {
+        try {
+            if ($null -ne $entry.Writer) { $entry.Writer.Dispose() }
+            elseif ($null -ne $entry.Stream) { $entry.Stream.Dispose() }
+            if ($entry.Created -and -not $entry.Published -and [IO.File]::Exists($entry.TemporaryPath)) {
+                [IO.File]::Delete($entry.TemporaryPath)
+            }
+        }
+        catch { Write-Warning "Export staging cleanup failed for $($entry.TemporaryPath); remove this private partial file manually." }
+    }
 }
