@@ -3,6 +3,8 @@
 - [Developer premium app inventory](DeveloperPremiumAppInventory/README.md): read-only,
   tenant-wide PowerShell inventory of premium-capability apps in unmanaged Developer
   environments, with resumable paging, throttling protection, and explicit coverage/review reports.
+- [Flow run history](FlowRunHistory/README.md): PowerShell 5.1/7 cloud-flow history,
+  trigger/action details, error messages, and Dataverse/SharePoint calling record IDs.
 
 
 Copyright 2025 Jake Gwynn
