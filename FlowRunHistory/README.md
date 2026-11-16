@@ -3,7 +3,9 @@
 `Get-FlowRunHistory.ps1` reads existing **cloud-flow** history in Windows
 PowerShell **5.1** and PowerShell **7**, without modifying flows, taking ownership,
 resubmitting runs, or changing environment settings. No source-flow edits are needed.
-It supports both solution and non-solution cloud flows in commercial-cloud tenants.
+It supports both solution and non-solution cloud flows, with explicit **Public**
+and **GCC (Moderate)** routing. GCC settings are grounded in Microsoft references
+and offline tests; no live GCC tenant was available.
 
 ## Quick start
 
@@ -88,7 +90,7 @@ from the information already retrieved. Record-only mode produces run/record
 context without persisting the trigger business payload. `-IdOnly` CSV is
 genuinely minimal: **only `RecordId`**, with no type/context/payload columns.
 
-Columns preserve run and operation statuses, UTC times/durations, definition paths,
+Columns preserve tenant and cloud, run and operation statuses, UTC times/durations, definition paths,
 iteration names/indexes, tracking/request/correlation IDs, errors, payload
 availability, coverage/issues, and extracted record/site/list context.
 Normal pipeline, JSON, and CSV results retain the explicit `TenantId`, so records
@@ -139,16 +141,24 @@ a guest needs the appropriate target-tenant access and consent.
 
 Choose either:
 
-1. **Existing, optional Az.Accounts module:** without `-AccessToken`, the script
-   calls `Connect-AzAccount -Tenant <TenantId> -Environment AzureCloud -Scope Process`.
+1. **Automatic Microsoft sign-in:** without `-AccessToken`, the script ensures
+   `Az.Accounts` is available, then calls
+   `Connect-AzAccount -Tenant <TenantId> -Environment AzureCloud -Scope Process -SkipContextPopulation`.
    To deliberately reuse a sign-in, add `-UseExistingContext`; the existing context
-   must be a **User**, in the specified tenant, in **AzureCloud**. Az token
+   must be a **User**, in the specified tenant, in the selected identity authority.
+   Public and standard GCC both use **AzureCloud / public Entra**. Az token
    acquisition uses that context and explicit tenant on each service request.
+   Add `-DeviceCode` to choose Microsoft device-code authentication instead of
+   browser/broker sign-in; it cannot be combined with a supplied token or reused context.
+   Automatic subscription-context population is skipped. The reader's API calls
+   do not use an Azure subscription; sign-in remains subject to the selected
+   Az client and the tenant's authorization policies.
 2. **Externally acquired delegated token:** pass `-AccessToken` as a String,
    SecureString, or token result with a `Token` property. No module is needed.
    The token must be issued for the Flow service, not Graph, ARM, or Dataverse.
-   The recognized Flow audiences are `https://service.flow.microsoft.com/`
-   and `https://api.flow.microsoft.com/`.
+   Public recognizes `https://service.flow.microsoft.com/` and
+   `https://api.flow.microsoft.com/`; GCC requires
+   `https://gov.service.flow.microsoft.us/`.
 
 For **token acquisition**, use `https://service.flow.microsoft.com/`. The API
 host `https://api.flow.microsoft.com` is not interchangeable with that resource:
@@ -156,13 +166,42 @@ requesting a token for the API-host URI can fail with `AADSTS500011` (resource
 principal not found). Accepting an externally issued token's audience does not
 mean that every tenant has an application principal for that audience.
 
-Nothing installs automatically. If you choose Az.Accounts, install it yourself
-in the engine you will use, subject to your organization's installation policy.
-Windows PowerShell's Az.Accounts prerequisites also apply. For example:
+### Automatic dependency installation
+
+The script reuses a compatible installed `Az.Accounts` **5.3.4 or later**.
+If missing/older, it installs the known-compatible **5.3.4** package for
+**CurrentUser only**, not the entire Az rollup. PowerShellGet is preferred on
+both engines; installed PSResourceGet can be used when PowerShellGet is absent.
+Only the explicitly selected `-DependencyRepository` is used (default PSGallery).
+The script checks the official Gallery source URL and can register the default
+Gallery if absent. A custom repository must already be registered **and trusted**
+in the selected package manager, with a credential-free HTTPS URL. It never
+changes persistent repository trust, elevates, changes execution policy, disables
+certificate/publisher verification, or falls back to another repository.
+
+For PowerShellGet, a missing NuGet provider (minimum 2.8.5.201) is bootstrapped for
+CurrentUser. TLS 1.2 is enabled for installation and the original process settings
+are restored afterward, including on failure. Existing older loaded Az assemblies
+are not replaced: start a fresh PowerShell process instead. Windows PowerShell
+still requires .NET Framework 4.7.2 or later. Firewall/proxy access, organization
+package/credential-provider policies, and the host's execution/signature policies
+still apply. An installation failure is a terminating, actionable error, not a
+silent login fallback.
+
+Use `-SkipDependencyInstall` for pre-provisioned/offline machines. A supplied
+`-AccessToken` always skips module/provider installation. For example:
 
 ```powershell
-Connect-AzAccount -Tenant $tenant -Environment AzureCloud -Scope Process
+# Automatically install the auth dependency if necessary and prompt for sign-in.
+.\Get-FlowRunHistory.ps1 @p -FlowId $flow -Errors -LastDays 7 -CsvPath '.\errors.csv'
+
+# An explicitly selected, already-trusted organization package repository.
+.\Get-FlowRunHistory.ps1 @p -DependencyRepository MyApprovedRepo -FlowId $flow -Errors
+
+# Do not install anything; deliberately reuse a matching existing sign-in.
+Connect-AzAccount -Tenant $tenant -Environment AzureCloud -Scope Process -SkipContextPopulation
 .\Get-FlowRunHistory.ps1 @p -UseExistingContext -FlowId $flow -Errors -LastDays 7
+.\Get-FlowRunHistory.ps1 @p -UseExistingContext -SkipDependencyInstall -FlowId $flow
 
 # Or obtain a token explicitly and use the dependency-free script path.
 $token = Get-AzAccessToken -TenantId $tenant -ResourceUrl 'https://service.flow.microsoft.com/'
@@ -170,7 +209,7 @@ $token = Get-AzAccessToken -TenantId $tenant -ResourceUrl 'https://service.flow.
 ```
 
 For another tenant, change **both** `TenantId` and `EnvironmentName`, then sign
-in to that tenant or supply its token. Tenant/audience/expiry/delegated-token
+in to that tenant or supply its token. Tenant/issuer/audience/expiry/delegated-token
 claims are checked before requests. These local JWT checks are safeguards, **not
 signature validation**; the service validates the actual token and permissions.
 Opaque/encrypted tokens are not accepted. Do not put tokens in source files or
@@ -185,7 +224,47 @@ chosen admin operation. Consent alone is not resource access. Conditional Access
 MFA, disabled public clients, and tenant consent restrictions still apply.
 If the Az client cannot obtain an authorized Flow token, use an approved delegated
 client/token instead; the script does not try app-only credentials or weaker
-permissions. Sovereign clouds are **not** claimed as supported.
+permissions.
+
+### Standard GCC (Government Community Cloud / Moderate)
+
+Use **`-Cloud GCC`** explicitly. Standard GCC is not GCC High or DoD.
+Microsoft's government service description and Power Platform authentication
+module confirm that standard GCC uses **public Entra ID**, while its Power
+Automate runtime and data are government-hosted:
+
+| Setting | Public | GCC |
+| --- | --- | --- |
+| Entra authority | `login.microsoftonline.com` | `login.microsoftonline.com` |
+| Az identity environment | `AzureCloud` | `AzureCloud` |
+| Flow API host | `api.flow.microsoft.com` | `gov.api.flow.microsoft.us` |
+| Token resource | `https://service.flow.microsoft.com/` | `https://gov.service.flow.microsoft.us/` |
+| Dataverse organization | `org.crm*.dynamics.com` (not crm9) | `org.crm9.dynamics.com` |
+
+```powershell
+.\Get-FlowRunHistory.ps1 -Cloud GCC -TenantId $tenant -EnvironmentName $environment `
+    -AllFlows -AsAdmin -Status Failed -LastDays 7 -Errors `
+    -CsvPath '.\gcc-failed.csv' -JsonPath '.\gcc-failed.json'
+
+# Optional Dataverse primary-key metadata in the same GCC tenant.
+.\Get-FlowRunHistory.ps1 -Cloud GCC -TenantId $tenant -EnvironmentName $environment `
+    -FlowId $flow -CallingRecordId -DataverseUrl 'https://YOUR-ORG.crm9.dynamics.com/'
+```
+
+Flow tokens, authenticated metadata requests, paging, and anonymous payload-host
+validation stay within the selected cloud. GCC content can use documented
+`*.logic.azure.us`, `*.api.gov.powerplatform.microsoft.us`,
+`gov.api.flow.microsoft.us`, and `*.blob.core.usgovcloudapi.net` hosts.
+Commercial runtime/storage hosts are not accepted for a GCC run, nor are GCC
+High/DoD endpoints. There is no cross-cloud fallback. Unknown/blocked content
+hosts are visible in `Issues`/payload availability, never silently downloaded.
+
+These government route/authentication settings are documentation/fixture-tested,
+**not live GCC validation or a supported-API compatibility guarantee**. GCC
+service parity, consent, managed network/SAS-IP restrictions and undocumented
+run/action/repetition endpoints may still vary. GCC High, DoD and China are
+deliberately **not supported** rather than guessed from a hostname substitution.
+Do not pass `AzureUSGovernment` credentials for standard GCC; it uses public Entra.
 
 ## Calling Dataverse rows and SharePoint items
 
@@ -269,7 +348,10 @@ code, message, and details. A null message means the service returned no message
 a generic run error never replaces a more specific action-output error.
 `-All` preserves the run envelope and available operation metadata, full
 input/output envelopes, retry history, nested actions, and repetition indexes.
-Payload scalars and binary-content JSON envelopes remain their original shapes.
+Payload scalars, zero/one/many root JSON arrays, and binary-content JSON envelopes
+retain their shapes. Timestamp strings are preserved with `DateKind String`
+on PowerShell 7.5+; earlier engines use their native JSON date parsing/serialization
+and may normalize their representation without changing the timestamp instant.
 Child-flow runs must be selected separately. Raw binary responses are represented
 losslessly with `$content-type` and base64 `$content`; empty text is not treated
 as valid empty JSON.
@@ -320,7 +402,7 @@ catch that error before treating manually piped exports as complete. The direct
 Signed content links are fetched **without a Flow/Dataverse bearer token**.
 Only HTTPS Microsoft runtime/content hosts are accepted, redirects are disabled,
 and links/Authorization values are redacted from returned metadata and failures.
-This includes environment-scoped
+For Public, this includes environment-scoped
 `*.environment.api.powerplatformusercontent.com` content, restricted to HTTPS
 port 443 and `/storage/powerautomate/automations/` paths.
 An unrecognized content host is blocked and reported, not automatically trusted.
@@ -351,7 +433,11 @@ The matrix covers single/multiple/all flow and run selection, solution inclusion
 UTC/status/rolling filters, paging on flows/runs/actions/repetitions, nested actions,
 error/retry projections, no matches, throttling/auth/shape failures, safe record
 extraction, payload availability, and signed-link protections. Synthetic JWTs and
-an isolated Az.Accounts test double exercise tenant/audience/context selection.
+an isolated Az.Accounts test double exercise tenant/issuer/audience/context selection.
+GCC fixtures verify its public identity authority, government audience/API profile,
+crm9 metadata and per-cloud content-host checks, including wrong-cloud rejection.
+Bootstrap fixtures exercise both package managers, legacy flags, missing NuGet,
+installed/old/missing module states, opt-out, safe repositories, failures, and TLS restoration.
 Export regressions cover fixed/minimal CSV layouts, quote/newline/Unicode
 round-trips, locale-independent durations, zero/one/many JSON arrays, simultaneous
 formats, existing/concurrently created destinations, late failures, pipeline
@@ -363,11 +449,26 @@ iterations, and failed-action messages. **A second real tenant has not been
 tested**: alternate-tenant coverage here is claim/context validation and fixtures,
 not proof that another tenant's permissions or authentication policy permits access.
 **Fixture tests do not establish live API compatibility or cross-tenant access.**
+After this update, real commercial retained trigger/action/record-ID and CSV/JSON
+checks were rerun successfully on both engines. A real current-user Az.Accounts
+installation also succeeded through an existing trusted enterprise repository
+using PowerShellGet. This machine's public-Gallery download and its PSResourceGet
+enterprise credential-provider attempt failed explicitly; neither was bypassed
+with relaxed certificate or repository-trust settings. Those network/provider
+conditions are environment-specific, not fixture-proven installation success.
+**GCC was not live-tested.** Native interactive/MFA flows and individual tenant
+consent policies cannot be established by synthetic authentication fixtures.
 Live validation requires an authorized delegated user/token, an environment,
 retained run IDs, and representative Dataverse/SharePoint/loop/secured runs.
 
 ## Sources
 
+- [Power Automate government service, GCC public identity, and domains](https://learn.microsoft.com/en-us/power-automate/us-govt)
+- [Microsoft Flow service audiences by cloud](https://learn.microsoft.com/en-us/power-automate/oauth-authentication#audience-values)
+- [Microsoft Power Platform auth module's GCC API and authority mapping](https://www.powershellgallery.com/packages/Microsoft.PowerApps.Administration.PowerShell/2.0.215/Content/Microsoft.PowerApps.AuthModule.psm1)
+- [Government API/runtime host allowlists](https://learn.microsoft.com/en-us/power-automate/ip-address-configuration#use-the-power-automate-web-portal)
+- [Az installation and Windows PowerShell prerequisites](https://learn.microsoft.com/en-us/powershell/azure/install-azps-windows)
+- [Az sign-in, context population, and device authentication](https://learn.microsoft.com/en-us/powershell/module/az.accounts/connect-azaccount)
 - [PnP CLI run retrieval and anonymous content requests](https://github.com/pnp/cli-microsoft365/blob/main/src/m365/flow/commands/run/run-get.ts)
 - [PnP CLI run listing, supported filters, and admin route](https://github.com/pnp/cli-microsoft365/blob/main/src/m365/flow/commands/run/run-list.ts)
 - [PnP CLI flow discovery, admin v2, and solution inclusion](https://github.com/pnp/cli-microsoft365/blob/main/src/m365/flow/commands/flow-list.ts)

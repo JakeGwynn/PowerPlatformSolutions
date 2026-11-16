@@ -5,7 +5,8 @@
   environments, with resumable paging, throttling protection, and explicit coverage/review reports.
 - [Flow run history](FlowRunHistory/README.md): PowerShell 5.1/7 cloud-flow history,
   trigger/action details, error messages, Dataverse/SharePoint calling record IDs,
-  and direct JSON/CSV exports.
+  direct JSON/CSV exports, automatic auth-dependency installation, and explicit
+  Public/GCC routing (GCC is documentation/fixture-tested, not live-tested).
 
 
 Copyright 2025 Jake Gwynn

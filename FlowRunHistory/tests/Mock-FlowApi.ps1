@@ -262,16 +262,30 @@ try {
                 $parameters = @{ 'subscriptionRequest/entityname' = 'accounts' }
                 if ($scenario -eq 'custom-primary-key') { $parameters['subscriptionRequest/entityname'] = 'new_widgets' }
                 if ($scenario -eq 'current-definition-only') { $hostInfo = $null }
-                if ($scenario -eq 'odata-table-context') { $parameters = @{} }
+                if ($scenario -in @('odata-table-context', 'canonical-map-conflict')) { $parameters = @{} }
                 Send-Response $context @{ host = $hostInfo; parameters = $parameters }; continue
             }
             if ($name -eq 'dv-output') {
+                if ($scenario -eq 'retry-body-read' -and $attempts[$path] -eq 1) {
+                    Send-Response $context '{}' -Raw -ContentType 'application/json; charset=invalid-charset'
+                    continue
+                }
+                if ($scenario -match '^root-array-([012])$') {
+                    $array = @(
+                        for ($i = 0; $i -lt [int]$Matches[1]; $i++) {
+                            @{ index = $i; date = '2026-11-01T12:13:14.1234567+03:00' }
+                        }
+                    )
+                    Send-Response $context -Body $array
+                    continue
+                }
                 $body = @{ accountid = $rowId; _primarycontactid_value = $lookupId; arbitraryid = $lookupId; SdkMessage = 'Update' }
                 switch ($scenario) {
                     'dv-odata' { $body.'@odata.id' = "https://example.crm.dynamics.com/api/data/v9.2/accounts($rowId)" }
                     'dv-editlink' { $body.'@odata.editLink' = "accounts($rowId)" }
                     'dv-context' { $body.PrimaryEntityName = 'account'; $body.PrimaryEntityId = $rowId }
                     'dv-conflict' { $body.'@odata.id' = "accounts($lookupId)" }
+                    'canonical-map-conflict' { $body.'@odata.id' = "accounts($lookupId)" }
                     'dv-value-column' { $body.value = @('a custom', 'array column') }
                     'odata-table-context' { $body.'@odata.context' = 'https://example.crm.dynamics.com/api/data/v9.2/$metadata#accounts/$entity' }
                     'custom-primary-key' { $body.Remove('accountid'); $body.new_unusualkey = $rowId }
@@ -360,6 +374,7 @@ try {
                 }
             }
             if ($scenario -eq 'invalid-json') { Send-Response $context '{invalid' 200 @{} -Raw; continue }
+            if ($scenario -eq 'non-object-json') { Send-Response $context '[]' 200 @{} -Raw; continue }
             if ($scenario -eq 'invalid-collection') { Send-Response $context @{ unexpected = @() }; continue }
             if ($scenario -eq 'invalid-value-shape') { Send-Response $context @{ value = @{ name = 'not-an-array' } }; continue }
         }

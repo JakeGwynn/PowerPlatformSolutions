@@ -25,6 +25,10 @@ The target Microsoft Entra tenant GUID. Always explicit, including for guests.
 .PARAMETER EnvironmentName
 The environment resource name, such as Default-<tenant-guid>, not its display name.
 
+.PARAMETER Cloud
+Public (default) or GCC (Government Community Cloud / Moderate).
+GCC uses public Entra authentication and government Flow endpoints, not GCC High.
+
 .PARAMETER FlowId
 One or more flow resource GUIDs. Omit to discover flows in the environment.
 
@@ -74,9 +78,21 @@ An externally acquired delegated Flow token (String, SecureString, or an object
 with a Token property). No module is needed when this is supplied.
 
 .PARAMETER UseExistingContext
-Use an existing Az.Accounts USER context in this tenant and AzureCloud.
-Without AccessToken or this switch, explicitly signs in to TenantId using the
-optional, already-installed Az.Accounts module. Never installs dependencies.
+Use an existing Az.Accounts USER context in this tenant and the selected cloud's
+identity authority. Otherwise the script initiates Microsoft sign-in.
+
+.PARAMETER DeviceCode
+Use Microsoft's device-code sign-in instead of browser/broker sign-in.
+Cannot be combined with AccessToken or UseExistingContext.
+
+.PARAMETER SkipDependencyInstall
+Do not install a missing/old Az.Accounts dependency. AccessToken never installs
+dependencies regardless of this switch.
+
+.PARAMETER DependencyRepository
+Repository for automatic current-user Az.Accounts installation (default PSGallery).
+PSGallery must have its official HTTPS URL. A custom repository must already
+be registered and trusted. No repository trust or execution policy is changed.
 
 .PARAMETER DataversePrimaryKey
 Optional hashtable of table logical/entity-set names to actual primary key
@@ -133,8 +149,13 @@ $flows = '22222222-2222-4222-8222-222222222222', '33333333-3333-4333-8333-333333
 .EXAMPLE
 .\Get-FlowRunHistory.ps1 -TenantId $tenant -EnvironmentName $environment -FlowId $flows -Status Failed -LastDays 7 -All -CsvPath '.\failed-runs.csv' -JsonPath '.\failed-runs.json'
 
+.EXAMPLE
+.\Get-FlowRunHistory.ps1 -Cloud GCC -TenantId $tenant -EnvironmentName $environment -AllFlows -AsAdmin -Status Failed -LastDays 7 -Errors -CsvPath '.\gcc-errors.csv'
+
 .NOTES
-Windows PowerShell 5.1 / PowerShell 7. Commercial cloud only.
+Windows PowerShell 5.1 / PowerShell 7. Public and GCC (Moderate) routing.
+GCC routing is documentation/fixture-verified, not live-tested. GCC High, DoD,
+and China are not supported. Only missing auth dependencies install automatically.
 Signed content links and Authorization values are redacted from returned data.
 Output can still contain sensitive business data; protect any exports.
 #>
@@ -142,6 +163,7 @@ Output can still contain sensitive business data; protect any exports.
 param(
     [Parameter(Mandatory)][guid]$TenantId,
     [Parameter(Mandatory)][ValidateNotNullOrEmpty()][string]$EnvironmentName,
+    [ValidateSet('Public', 'GCC')][string]$Cloud = 'Public',
     [Alias('FlowIds')][string[]]$FlowId = @(),
     [Alias('RunIds')][string[]]$RunId = @(),
     [switch]$AllFlows,
@@ -158,6 +180,9 @@ param(
     [switch]$AsAdmin,
     [object]$AccessToken,
     [switch]$UseExistingContext,
+    [switch]$DeviceCode,
+    [switch]$SkipDependencyInstall,
+    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9_.-]*$')][string]$DependencyRepository = 'PSGallery',
     [ValidateNotNull()][hashtable]$DataversePrimaryKey = @{},
     [uri]$DataverseUrl,
     [object]$DataverseAccessToken,
@@ -175,8 +200,14 @@ $ErrorActionPreference = 'Stop'
 $supplied = @{} + $PSBoundParameters
 $invocationTime = [DateTimeOffset]::UtcNow
 $apiVersion = 'api-version=2016-11-01'
-$flowAudience = 'https://service.flow.microsoft.com/'
-$apiBase = [uri]'https://api.flow.microsoft.com'
+$cloudProfile = $null
+$flowAudience = $null
+$apiBase = $null
+$minimumAzVersion = [version]'5.3.4'
+$installAzVersion = '5.3.4'
+$jsonParameters = @{}
+if ($PSVersionTable.PSVersion.Major -ge 6) { $jsonParameters.NoEnumerate = $true }
+if ($PSVersionTable.PSVersion -ge [version]'7.5') { $jsonParameters.DateKind = 'String' }
 $azContext = $null
 $metadataCache = @{}
 $definitionCache = @{}
@@ -187,7 +218,7 @@ $exportResultCount = 0
 $csvParameters = @{ Delimiter = ',' }
 if ($PSVersionTable.PSVersion.Major -lt 6) { $csvParameters.NoTypeInformation = $true }
 $csvColumns = @(
-    'RowType', 'TenantId', 'EnvironmentName', 'FlowId', 'FlowDisplayName', 'RunId', 'RunStatus',
+    'RowType', 'TenantId', 'Cloud', 'EnvironmentName', 'FlowId', 'FlowDisplayName', 'RunId', 'RunStatus',
     'RunStartTimeUtc', 'RunEndTimeUtc', 'RunDurationSeconds', 'OperationName', 'DefinitionPath',
     'RepetitionName', 'OperationId', 'Status', 'Code', 'StartTimeUtc', 'EndTimeUtc', 'DurationSeconds',
     'ClientTrackingId', 'TrackingId', 'ActionTrackingId', 'ClientRequestId', 'ServiceRequestId',
@@ -232,6 +263,35 @@ function Get-Entries {
     }
 }
 
+function Get-CloudProfile {
+    param([ValidateSet('Public', 'GCC')][string]$Name)
+    if ($Name -eq 'GCC') {
+        return [pscustomobject]@{
+            Name = 'GCC'; AzEnvironment = 'AzureCloud'; Authority = 'https://login.microsoftonline.com'
+            ApiBase = 'https://gov.api.flow.microsoft.us'
+            Audience = 'https://gov.service.flow.microsoft.us/'
+            Audiences = @('https://gov.service.flow.microsoft.us/')
+            DataversePattern = '^[a-z0-9][a-z0-9-]*\.crm9\.dynamics\.com$'
+            ContentSuffixes = @('logic.azure.us', 'api.gov.powerplatform.microsoft.us',
+                'gov.api.flow.microsoft.us', 'blob.core.usgovcloudapi.net')
+        }
+    }
+    return [pscustomobject]@{
+        Name = 'Public'; AzEnvironment = 'AzureCloud'; Authority = 'https://login.microsoftonline.com'
+        ApiBase = 'https://api.flow.microsoft.com'
+        Audience = 'https://service.flow.microsoft.com/'
+        Audiences = @('https://service.flow.microsoft.com/', 'https://api.flow.microsoft.com/')
+        DataversePattern = '^[a-z0-9][a-z0-9-]*\.crm(?:[0-8]|[1-9][0-9]+)?\.dynamics\.com$'
+        ContentSuffixes = @('logic.azure.com', 'api.powerplatform.com', 'flow.microsoft.com', 'blob.core.windows.net')
+    }
+}
+
+function ConvertFrom-ServiceJson {
+    param([string]$Content)
+    $decoded = ConvertFrom-Json -InputObject $Content @jsonParameters -ErrorAction Stop
+    return ,$decoded
+}
+
 function Protect-Text {
     param([string]$Text)
     $clean = [regex]::Replace($Text, '(?i)\bBearer\s+[A-Za-z0-9._~+/-]+=*', 'Bearer [REDACTED]')
@@ -250,6 +310,12 @@ function Protect-Data {
     if ($null -eq $Value) { return $null }
     if ($Value -is [string]) { return Protect-Text $Value }
     if ($Value -is [ValueType]) { return $Value }
+    if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [System.Collections.IDictionary]) {
+        $items = @(
+            foreach ($item in $Value) { Protect-Data $item ($Depth + 1) }
+        )
+        return ,$items
+    }
     if ($Value -is [System.Collections.IDictionary] -or $Value -is [pscustomobject]) {
         $result = [ordered]@{}
         foreach ($entry in @(Get-Entries $Value)) {
@@ -262,12 +328,6 @@ function Protect-Data {
             else { $result[$entry.Name] = Protect-Data $entry.Value ($Depth + 1) }
         }
         return [pscustomobject]$result
-    }
-    if ($Value -is [System.Collections.IEnumerable]) {
-        $items = @(
-            foreach ($item in $Value) { Protect-Data $item ($Depth + 1) }
-        )
-        return ,$items
     }
     return Protect-Text ([string]$Value)
 }
@@ -315,6 +375,14 @@ function Assert-Token {
     if ([string](Get-Field $claims 'tid') -ne $TenantId.ToString()) {
         throw 'Token tenant does not match TenantId. Sign in to the target tenant explicitly.'
     }
+    $issuer = [string](Get-Field $claims 'iss')
+    $validIssuers = @(
+        "https://sts.windows.net/$($TenantId.ToString())/",
+        "$($cloudProfile.Authority)/$($TenantId.ToString())/v2.0"
+    )
+    if ($issuer -notin $validIssuers) {
+        throw 'Token issuer does not match the selected cloud identity authority and tenant. No cross-cloud fallback is used.'
+    }
     $audience = ([string](Get-Field $claims 'aud')).TrimEnd('/')
     $expected = @($Audiences | ForEach-Object { $_.TrimEnd('/') })
     if ($audience -notin $expected) {
@@ -335,23 +403,123 @@ function Assert-Token {
     }
 }
 
-function Initialize-AzContext {
-    if (-not (Get-Module -ListAvailable -Name Az.Accounts)) {
-        throw 'Supply AccessToken, or install Az.Accounts yourself in this PowerShell engine. No dependency is installed automatically.'
+function Install-AzAccounts {
+    $originalProtocol = [Net.ServicePointManager]::SecurityProtocol
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = $originalProtocol -bor [Net.SecurityProtocolType]::Tls12
+        Write-Information "Installing Az.Accounts $installAzVersion for CurrentUser from $DependencyRepository." -InformationAction Continue
+        if (-not (Get-Command Install-Module -ErrorAction SilentlyContinue) -and
+            (Get-Command Install-PSResource -ErrorAction SilentlyContinue)) {
+            $repositories = @(Get-PSResourceRepository -ErrorAction Stop | Where-Object Name -eq $DependencyRepository)
+            if ($repositories.Count -eq 0 -and $DependencyRepository -eq 'PSGallery') {
+                Register-PSResourceRepository -PSGallery -ErrorAction Stop
+                $repositories = @(Get-PSResourceRepository -ErrorAction Stop | Where-Object Name -eq 'PSGallery')
+            }
+            if ($repositories.Count -ne 1) { throw 'The dependency repository is not registered uniquely.' }
+            $repository = $repositories[0]
+            $source = [uri]$repository.Uri
+            if ($DependencyRepository -eq 'PSGallery') {
+                if ($source.AbsoluteUri.TrimEnd('/') -ne 'https://www.powershellgallery.com/api/v2') {
+                    throw 'PSGallery is not registered with its official source URL; it was not modified or trusted.'
+                }
+            }
+            elseif (-not $repository.Trusted) { throw 'The selected custom dependency repository must already be trusted.' }
+            if ($source.Scheme -ne 'https' -or $source.UserInfo -or $source.Query -or $source.Fragment) {
+                throw 'Dependency repositories must use an HTTPS source without embedded credentials or query parameters.'
+            }
+            Install-PSResource -Name Az.Accounts -Version $installAzVersion -Repository $DependencyRepository `
+                -Scope CurrentUser -TrustRepository -AcceptLicense -Quiet -ErrorAction Stop
+        }
+        else {
+            if (-not (Get-Command Install-Module -ErrorAction SilentlyContinue)) {
+                throw 'Neither PowerShellGet nor PSResourceGet is installed. Preinstall Az.Accounts or use AccessToken.'
+            }
+            $repositories = @(Get-PSRepository -ErrorAction Stop | Where-Object Name -eq $DependencyRepository)
+            if ($repositories.Count -eq 0 -and $DependencyRepository -eq 'PSGallery') {
+                Register-PSRepository -Default -ErrorAction Stop
+                $repositories = @(Get-PSRepository -ErrorAction Stop | Where-Object Name -eq 'PSGallery')
+            }
+            if ($repositories.Count -ne 1) { throw 'The dependency repository is not registered uniquely.' }
+            $repository = $repositories[0]
+            $source = [uri]$repository.SourceLocation
+            if ($DependencyRepository -eq 'PSGallery') {
+                if ($source.AbsoluteUri.TrimEnd('/') -ne 'https://www.powershellgallery.com/api/v2') {
+                    throw 'PSGallery is not registered with its official source URL; it was not modified or trusted.'
+                }
+            }
+            elseif ($repository.InstallationPolicy -ne 'Trusted') {
+                throw 'The selected custom dependency repository must already be trusted.'
+            }
+            if ($source.Scheme -ne 'https' -or $source.UserInfo -or $source.Query -or $source.Fragment) {
+                throw 'Dependency repositories must use an HTTPS source without embedded credentials or query parameters.'
+            }
+            $providers = @(Get-PackageProvider -ListAvailable -ErrorAction Stop |
+                Where-Object { $_.Name -eq 'NuGet' -and $_.Version -ge [version]'2.8.5.201' })
+            if ($providers.Count -eq 0) {
+                $null = Install-PackageProvider -Name NuGet -MinimumVersion '2.8.5.201' -Scope CurrentUser -Force -ErrorAction Stop
+            }
+            $install = @{
+                Name = 'Az.Accounts'; RequiredVersion = $installAzVersion
+                Repository = $DependencyRepository; Scope = 'CurrentUser'; Force = $true; ErrorAction = 'Stop'
+            }
+            if ((Get-Command Install-Module).Parameters.ContainsKey('AcceptLicense')) { $install.AcceptLicense = $true }
+            Install-Module @install
+        }
     }
-    Import-Module Az.Accounts -ErrorAction Stop
+    catch {
+        throw [InvalidOperationException]::new(
+            "Automatic Az.Accounts installation failed. Check repository/proxy access and organization policy, or preinstall the module and use -SkipDependencyInstall / -AccessToken. $(Protect-Text $_.Exception.Message)")
+    }
+    finally { [Net.ServicePointManager]::SecurityProtocol = $originalProtocol }
+}
+
+function Initialize-AzModule {
+    $loaded = @(Get-Module -Name Az.Accounts)
+    if ($loaded.Count -gt 0 -and @($loaded | Where-Object Version -lt $minimumAzVersion).Count -gt 0) {
+        throw "An older Az.Accounts is already loaded. Start a fresh PowerShell process with Az.Accounts $minimumAzVersion or later; loaded assemblies will not be replaced."
+    }
+    $available = @(Get-Module -ListAvailable -Name Az.Accounts |
+        Where-Object { $_.Version -ge $minimumAzVersion -and
+            ($null -eq $_.PowerShellVersion -or $_.PowerShellVersion -le $PSVersionTable.PSVersion) } |
+        Sort-Object Version -Descending)
+    if ($available.Count -eq 0) {
+        if ($SkipDependencyInstall) {
+            throw "Az.Accounts $minimumAzVersion or later is missing for this engine. Remove -SkipDependencyInstall to install it, preinstall it, or supply -AccessToken."
+        }
+        Install-AzAccounts
+        $available = @(Get-Module -ListAvailable -Name Az.Accounts |
+            Where-Object { $_.Version -ge $minimumAzVersion -and
+                ($null -eq $_.PowerShellVersion -or $_.PowerShellVersion -le $PSVersionTable.PSVersion) } |
+            Sort-Object Version -Descending)
+    }
+    if ($available.Count -eq 0) { throw 'Az.Accounts installation did not produce a compatible module in this engine module path.' }
+    try { Import-Module -Name $available[0].Path -ErrorAction Stop }
+    catch {
+        throw [InvalidOperationException]::new(
+            "Az.Accounts could not be imported. Windows PowerShell requires .NET Framework 4.7.2 or later; organization execution/signature policy still applies. $(Protect-Text $_.Exception.Message)")
+    }
+}
+
+function Initialize-AzContext {
+    Initialize-AzModule
     if ($UseExistingContext) {
-        $script:azContext = Get-AzContext -ErrorAction Stop
+        $script:azContext = Az.Accounts\Get-AzContext -ErrorAction Stop
     }
     else {
-        $login = Connect-AzAccount -Tenant $TenantId.ToString() -Environment AzureCloud -Scope Process -ErrorAction Stop
+        $loginParameters = @{
+            Tenant = $TenantId.ToString(); Environment = $cloudProfile.AzEnvironment
+            Scope = 'Process'; SkipContextPopulation = $true; ErrorAction = 'Stop'
+        }
+        if ($DeviceCode) { $loginParameters.UseDeviceAuthentication = $true }
+        $login = Az.Accounts\Connect-AzAccount @loginParameters
         $script:azContext = $login.Context
     }
     if ($null -eq $script:azContext -or
         [string]$script:azContext.Tenant.Id -ne $TenantId.ToString() -or
         [string]$script:azContext.Account.Type -ne 'User' -or
-        [string]$script:azContext.Environment.Name -ne 'AzureCloud') {
-        throw 'Az context must be a User in TenantId and AzureCloud. No other tenant/account context will be used.'
+        [string]$script:azContext.Environment.Name -ne $cloudProfile.AzEnvironment -or
+        ([string](Get-Field $script:azContext.Environment 'ActiveDirectoryAuthority')).TrimEnd('/') -ne $cloudProfile.Authority) {
+        throw 'Az context must be a User in TenantId and the selected cloud identity authority. No other tenant/account context will be used.'
     }
 }
 
@@ -359,7 +527,7 @@ function Get-ServiceToken {
     param([ValidateSet('Flow', 'Dataverse')][string]$Service)
     if ($Service -eq 'Flow') {
         $value = $AccessToken
-        $audiences = @($flowAudience, 'https://api.flow.microsoft.com/')
+        $audiences = $cloudProfile.Audiences
         $resource = $flowAudience
     }
     else {
@@ -369,7 +537,7 @@ function Get-ServiceToken {
     }
     if ($null -eq $value) {
         if ($null -eq $script:azContext) { throw 'Dataverse metadata requires DataverseAccessToken or the selected Az user context.' }
-        $value = Get-AzAccessToken -ResourceUrl $resource -TenantId $TenantId.ToString() -DefaultProfile $script:azContext -ErrorAction Stop
+        $value = Az.Accounts\Get-AzAccessToken -ResourceUrl $resource -TenantId $TenantId.ToString() -DefaultProfile $script:azContext -ErrorAction Stop
     }
     $plain = ConvertTo-PlainToken $value
     Assert-Token $plain $audiences
@@ -404,16 +572,16 @@ function Assert-ContentUri {
         throw 'Content link must use HTTPS on a supported Microsoft content host.'
     }
     $userContentSuffix = '.environment.api.powerplatformusercontent.com'
-    if ($Uri.DnsSafeHost.EndsWith($userContentSuffix, [StringComparison]::OrdinalIgnoreCase)) {
+    if ($cloudProfile.Name -eq 'Public' -and $Uri.DnsSafeHost.EndsWith($userContentSuffix, [StringComparison]::OrdinalIgnoreCase)) {
         $prefix = $Uri.DnsSafeHost.Substring(0, $Uri.DnsSafeHost.Length - $userContentSuffix.Length)
         if ($prefix -match '^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$' -and
             $Uri.AbsolutePath.StartsWith('/storage/powerautomate/automations/', [StringComparison]::Ordinal)) { return }
         throw 'Power Platform user-content link is outside the supported automation storage namespace.'
     }
-    foreach ($suffix in @('logic.azure.com', 'api.powerplatform.com', 'flow.microsoft.com', 'blob.core.windows.net')) {
+    foreach ($suffix in $cloudProfile.ContentSuffixes) {
         if ($Uri.DnsSafeHost -eq $suffix -or $Uri.DnsSafeHost.EndsWith('.' + $suffix, [StringComparison]::OrdinalIgnoreCase)) { return }
     }
-    throw 'Content link host is not supported. It was blocked; no bearer token or request was sent.'
+    throw 'Content link host is not supported in the selected cloud. It was blocked; no bearer token or request was sent.'
 }
 
 function Invoke-ReadRequest {
@@ -441,6 +609,7 @@ function Invoke-ReadRequest {
         $cancellation.CancelAfter([TimeSpan]::FromSeconds([Math]::Min($RequestTimeoutSeconds, $remaining)))
         $statusCode = 0
         $retryAfter = $null
+        $readFailed = $false
         try {
             $request.Headers.Accept.ParseAdd('application/json')
             if ($Service -ne 'Content') {
@@ -464,6 +633,7 @@ function Invoke-ReadRequest {
                 else { $content = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult() }
             }
             catch {
+                $readFailed = $true
                 if ($null -ne $response) { $statusCode = [int]$response.StatusCode }
                 if ($attempt -ge $MaxRetries) {
                     throw (New-HttpFailure "$Label could not be read (connection, timeout, or response-size limit); no response body or URL is logged." $statusCode)
@@ -473,7 +643,7 @@ function Invoke-ReadRequest {
             if ($statusCode -ge 200 -and $statusCode -lt 300 -and $null -ne $content) {
                 return [pscustomobject]@{ Content = $content; MediaType = $mediaType; IsBinary = [bool]$binary }
             }
-            $transient = $statusCode -eq 0 -or $statusCode -in @(408, 429, 500, 502, 503, 504)
+            $transient = $readFailed -or $statusCode -eq 0 -or $statusCode -in @(408, 429, 500, 502, 503, 504)
             if (-not $transient -or $attempt -ge $MaxRetries) {
                 $hint = ''
                 if ($statusCode -eq 401) { $hint = ' Acquire a fresh correct-audience token in TenantId.' }
@@ -508,9 +678,12 @@ function Invoke-ReadRequest {
 function Get-ServiceJson {
     param([uri]$Uri, [string]$Label, [string]$Service = 'Flow')
     $response = Invoke-ReadRequest $Uri $Service $Label
-    try { $parsed = ConvertFrom-Json -InputObject $response.Content -ErrorAction Stop }
+    try { $parsed = ConvertFrom-ServiceJson $response.Content }
     catch { throw (New-HttpFailure "$Label returned invalid JSON; no response body is logged.") }
     if ($null -eq $parsed) { throw (New-HttpFailure "$Label returned an empty JSON response.") }
+    if ($parsed -is [array] -or $parsed -is [ValueType] -or $parsed -is [string]) {
+        throw (New-HttpFailure "$Label did not return a JSON object; results are incomplete.")
+    }
     return ,$parsed
 }
 
@@ -573,7 +746,7 @@ function Get-Payload {
             }
             return [pscustomobject]@{ Availability = 'Available'; Reason = 'Empty text content'; Content = $response.Content }
         }
-        try { $data = ConvertFrom-Json -InputObject $response.Content -ErrorAction Stop }
+        try { $data = ConvertFrom-ServiceJson $response.Content }
         catch {
             if ($response.MediaType -match '(?i)(/json|\+json)') {
                 return [pscustomobject]@{ Availability = 'Unreadable'; Reason = 'The content endpoint returned invalid JSON.'; Content = $null }
@@ -680,7 +853,7 @@ function Add-OperationErrors {
         $body = $output
         if (Test-Field $output 'body') { $body = Get-Field $output 'body' }
         if ($body -is [string]) {
-            try { $body = ConvertFrom-Json -InputObject $body -ErrorAction Stop }
+            try { $body = ConvertFrom-ServiceJson $body }
             catch { $body = [pscustomobject]@{ message = $body } }
         }
         $bodyError = Get-Field $body 'error'
@@ -935,9 +1108,11 @@ function Get-CallingRecord {
             })
             $record.Table = [string](Get-Field $body 'PrimaryEntityName')
         }
-        if ($candidates.Count -eq 0 -or $DataversePrimaryKey.ContainsKey([string]$context.Table)) {
+        if ($candidates.Count -eq 0 -or $DataversePrimaryKey.ContainsKey([string]$context.Table) -or
+            $DataversePrimaryKey.ContainsKey([string]$record.Table)) {
             $keyTable = $record.Table
-            if ($context.Table) { $keyTable = $context.Table }
+            if ($context.Table -and (-not $DataversePrimaryKey.ContainsKey([string]$record.Table) -or
+                    $DataversePrimaryKey.ContainsKey([string]$context.Table))) { $keyTable = $context.Table }
             try { $key = Get-DataverseKey $keyTable }
             catch {
                 $record.Availability = 'Unavailable'
@@ -1060,7 +1235,7 @@ function ConvertTo-CsvOperationRow {
     $correlation = Get-Field $properties 'correlation'
     $runCorrelation = Get-Field $runProperties 'correlation'
     $row.RowType = $RowType
-    foreach ($field in @('TenantId', 'EnvironmentName', 'FlowId', 'RunId')) { $row[$field] = Get-Field $Result $field }
+    foreach ($field in @('TenantId', 'Cloud', 'EnvironmentName', 'FlowId', 'RunId')) { $row[$field] = Get-Field $Result $field }
     $row.FlowDisplayName = $Context.FlowDisplayName
     $row.RunStatus = Get-Field $runProperties 'status'
     $row.RunStartTimeUtc = Get-ExportTime $runProperties 'startTime'
@@ -1275,7 +1450,7 @@ function Convert-RunResult {
     $properties = Get-Field $Run 'properties'
     $ExportContext.Run = $Run
     $result = [ordered]@{
-        TenantId = $TenantId.ToString(); EnvironmentName = $EnvironmentName; FlowId = $id
+        TenantId = $TenantId.ToString(); Cloud = $cloudProfile.Name; EnvironmentName = $EnvironmentName; FlowId = $id
         FlowDisplayName = (Get-Field (Get-Field $Flow 'properties') 'displayName')
         RunId = $runName; Status = (Get-Field $properties 'status')
         StartTime = $null; EndTime = $null
@@ -1326,9 +1501,12 @@ function Convert-RunResult {
             return
         }
         if (-not ($All -or $Errors)) {
-            $result = [ordered]@{ TenantId = $TenantId.ToString(); EnvironmentName = $EnvironmentName; FlowId = $id; RunId = $runName }
+            $result = [ordered]@{ TenantId = $TenantId.ToString(); Cloud = $cloudProfile.Name; EnvironmentName = $EnvironmentName; FlowId = $id; RunId = $runName }
         }
         $result.CallingRecord = $record
+        if ($record.Availability -in @('Unknown', 'Unavailable', 'Ambiguous', 'UnverifiedConnector')) {
+            Add-Issue $issues 'CallingRecord' $record.Availability $record.Reason
+        }
     }
     $result.DetailCoverage = 'AvailableServiceData'
     if ($issues.Count -gt 0) { $result.DetailCoverage = 'Partial' }
@@ -1337,6 +1515,9 @@ function Convert-RunResult {
 }
 
 try {
+    $cloudProfile = Get-CloudProfile $Cloud
+    $flowAudience = $cloudProfile.Audience
+    $apiBase = [uri]$cloudProfile.ApiBase
     if ($null -eq $FlowId) { $FlowId = @() }
     if ($null -eq $RunId) { $RunId = @() }
     if ($null -eq $Status) { $Status = @() }
@@ -1350,6 +1531,9 @@ try {
     if ($IdOnly -and (-not $CallingRecordId -or $All -or $Errors)) { throw 'IdOnly requires CallingRecordId without All or Errors.' }
     if ($supplied.ContainsKey('RecordSource') -and -not $CallingRecordId) { throw 'RecordSource requires CallingRecordId.' }
     if ($null -ne $AccessToken -and $UseExistingContext) { throw 'AccessToken and UseExistingContext cannot be combined.' }
+    if ($DeviceCode -and ($null -ne $AccessToken -or $UseExistingContext)) {
+        throw 'DeviceCode cannot be combined with AccessToken or UseExistingContext.'
+    }
     if ($supplied.ContainsKey('LastDays') -and ($From -or $To)) { throw 'LastDays cannot be combined with From or To.' }
     foreach ($dateParameter in @('From', 'To')) {
         if ($supplied.ContainsKey($dateParameter) -and [string]::IsNullOrWhiteSpace([string]$supplied[$dateParameter])) {
@@ -1361,6 +1545,9 @@ try {
         ($DataverseUrl.Scheme -ne 'https' -or $DataverseUrl.Port -ne 443 -or
          $DataverseUrl.UserInfo -or $DataverseUrl.Query -or $DataverseUrl.Fragment -or $DataverseUrl.AbsolutePath -ne '/')) {
         throw 'DataverseUrl must be an explicit HTTPS organization origin with no path, query, credentials, or nonstandard port.'
+    }
+    if ($null -ne $DataverseUrl -and $DataverseUrl.DnsSafeHost -notmatch $cloudProfile.DataversePattern) {
+        throw 'DataverseUrl is not a hosted Dataverse organization in the selected cloud. GCC requires an org.crm9.dynamics.com origin; no cross-cloud metadata request was sent.'
     }
     foreach ($table in @($DataversePrimaryKey.Keys)) {
         if ($table -notmatch '^[A-Za-z_][A-Za-z0-9_]*$' -or

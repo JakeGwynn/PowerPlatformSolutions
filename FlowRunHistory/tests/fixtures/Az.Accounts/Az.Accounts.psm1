@@ -10,9 +10,11 @@ function Get-Fixture {
 
 function Connect-AzAccount {
     [CmdletBinding()]
-    param([string]$Tenant, [string]$Environment, [string]$Scope)
+    param([string]$Tenant, [string]$Environment, [string]$Scope,
+        [switch]$SkipContextPopulation, [switch]$UseDeviceAuthentication)
     $fixture = Get-Fixture
-    $fixture.Calls.Add(@{ Command = 'Connect'; Tenant = $Tenant; Environment = $Environment; Scope = $Scope })
+    $fixture.Calls.Add(@{ Command = 'Connect'; Tenant = $Tenant; Environment = $Environment; Scope = $Scope
+        SkipContextPopulation = $SkipContextPopulation.IsPresent; DeviceCode = $UseDeviceAuthentication.IsPresent })
     return [pscustomobject]@{ Context = $fixture.Context }
 }
 

@@ -63,8 +63,8 @@ function Invoke-Test {
 function New-TestToken {
     param([string]$Tenant = $tenant, [string]$Audience = 'https://service.flow.microsoft.com/',
         [long]$Expiry = ([DateTimeOffset]::UtcNow.AddHours(1).ToUnixTimeSeconds()),
-        [switch]$AppOnly, [long]$NotBefore = 0)
-    $claims = @{ tid = $Tenant; aud = $Audience; exp = $Expiry; nbf = $NotBefore; scp = 'Flows.Read.All'; idtyp = 'user' }
+        [switch]$AppOnly, [long]$NotBefore = 0, [string]$Issuer = "https://sts.windows.net/$Tenant/")
+    $claims = @{ tid = $Tenant; iss = $Issuer; aud = $Audience; exp = $Expiry; nbf = $NotBefore; scp = 'Flows.Read.All'; idtyp = 'user' }
     if ($AppOnly) { $claims.Remove('scp'); $claims.idtyp = 'app' }
     $json = ConvertTo-Json -InputObject $claims -Compress
     $encoded = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($json)).TrimEnd('=').Replace('+', '-').Replace('/', '_')
@@ -89,14 +89,124 @@ function Invoke-History {
 }
 
 function New-AuthFixture {
-    param([string]$ContextTenant = $tenant, [string]$AccountType = 'User', [string]$Cloud = 'AzureCloud')
+    param([string]$ContextTenant = $tenant, [string]$AccountType = 'User', [string]$Cloud = 'AzureCloud',
+        [string]$Authority = 'https://login.microsoftonline.com')
     return @{
         Token = New-TestToken
         Context = [pscustomobject]@{
-            Tenant = @{ Id = $ContextTenant }; Account = @{ Type = $AccountType }; Environment = @{ Name = $Cloud }
+            Tenant = @{ Id = $ContextTenant }; Account = @{ Type = $AccountType }
+            Environment = @{ Name = $Cloud; ActiveDirectoryAuthority = $Authority }
         }
         Calls = [System.Collections.Generic.List[object]]::new()
     }
+}
+
+function Get-SourceFunction {
+    param([string]$Name)
+    $tokens = $null; $parseErrors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile($scriptPath, [ref]$tokens, [ref]$parseErrors)
+    if ($parseErrors.Count -gt 0) { throw 'The reader contains parse errors.' }
+    return $ast.Find({
+        param($candidate)
+        $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and $candidate.Name -eq $Name
+    }, $true)
+}
+
+function Invoke-DependencyFixture {
+    param(
+        [ValidateSet('PSResource', 'PowerShellGet', 'None')][string]$Mode = 'PSResource',
+        [string]$Repository = 'PSGallery',
+        [string]$Source = 'https://www.powershellgallery.com/api/v2',
+        [bool]$Trusted = $false,
+        [switch]$RepositoryMissing,
+        [switch]$NuGetMissing,
+        [switch]$ModulePresent,
+        [switch]$OldLoaded,
+        [switch]$SkipInstall,
+        [switch]$InstallFailure,
+        [switch]$InstallNoModule,
+        [switch]$OldPowerShellGet
+    )
+    $state = @{
+        Calls = [System.Collections.Generic.List[object]]::new()
+        Installed = $ModulePresent.IsPresent; Registered = -not $RepositoryMissing
+    }
+    $minimumAzVersion = [version]'5.3.4'; $installAzVersion = '5.3.4'
+    $DependencyRepository = $Repository; $SkipDependencyInstall = $SkipInstall
+    function Get-Module {
+        param([string]$Name, [switch]$ListAvailable)
+        if (-not $ListAvailable) {
+            if ($OldLoaded) { [pscustomobject]@{ Version = [version]'1.0'; Name = 'Az.Accounts' } }
+        }
+        elseif ($state.Installed) {
+            [pscustomobject]@{ Version = [version]'5.3.4'; Path = 'auth-fixture'; PowerShellVersion = [version]'5.1' }
+        }
+    }
+    function Get-Command {
+        param([string]$Name)
+        if ($Mode -eq 'None' -and $Name -in @('Install-Module', 'Install-PSResource')) { return $null }
+        if ($Name -eq 'Install-PSResource' -and $Mode -eq 'PowerShellGet') { return $null }
+        if ($Name -eq 'Install-Module' -and $Mode -eq 'PSResource') { return $null }
+        $parameters = @{}
+        if (-not $OldPowerShellGet) { $parameters.AcceptLicense = $true }
+        return [pscustomobject]@{ Name = $Name; Parameters = $parameters }
+    }
+    function Get-PSResourceRepository {
+        if ($state.Registered) { [pscustomobject]@{ Name = $Repository; Uri = $Source; Trusted = $Trusted } }
+    }
+    function Get-PSRepository {
+        if ($state.Registered) {
+            [pscustomobject]@{ Name = $Repository; SourceLocation = $Source
+                InstallationPolicy = $(if ($Trusted) { 'Trusted' } else { 'Untrusted' }) }
+        }
+    }
+    function Register-PSResourceRepository {
+        [CmdletBinding()]param([switch]$PSGallery)
+        $state.Registered = $true
+        $state.Calls.Add(@{ Command = 'Register'; Gallery = $PSGallery.IsPresent })
+    }
+    function Register-PSRepository {
+        [CmdletBinding()]param([switch]$Default)
+        $state.Registered = $true
+        $state.Calls.Add(@{ Command = 'Register'; Gallery = $Default.IsPresent })
+    }
+    function Get-PackageProvider {
+        param([switch]$ListAvailable)
+        if (-not $NuGetMissing) { [pscustomobject]@{ Name = 'NuGet'; Version = [version]'2.8.5.208' } }
+    }
+    function Install-PackageProvider {
+        [CmdletBinding()]param([string]$Name, [string]$MinimumVersion, [string]$Scope, [switch]$Force)
+        $state.Calls.Add(@{ Command = 'NuGet'; Name = $Name; MinimumVersion = $MinimumVersion; Scope = $Scope; Force = $Force.IsPresent })
+    }
+    function Install-PSResource {
+        [CmdletBinding()]param([string]$Name, [string]$Version, [string]$Repository, [string]$Scope,
+            [switch]$TrustRepository, [switch]$AcceptLicense, [switch]$Quiet)
+        $state.Calls.Add(@{ Command = 'Install'; Name = $Name; Version = $Version; Repository = $Repository
+            Scope = $Scope; AcceptLicense = $AcceptLicense.IsPresent })
+        if ($InstallFailure) { throw 'Fixture repository download failed.' }
+        $state.Installed = -not $InstallNoModule
+    }
+    function Install-Module {
+        [CmdletBinding()]param([string]$Name, [string]$RequiredVersion, [string]$Repository, [string]$Scope,
+            [switch]$Force, [switch]$AcceptLicense)
+        $state.Calls.Add(@{ Command = 'Install'; Name = $Name; Version = $RequiredVersion; Repository = $Repository
+            Scope = $Scope; AcceptLicense = $AcceptLicense.IsPresent; Force = $Force.IsPresent })
+        if ($InstallFailure) { throw 'Fixture repository download failed.' }
+        $state.Installed = -not $InstallNoModule
+    }
+    function Import-Module {
+        [CmdletBinding()]param([string]$Name)
+        $state.Calls.Add(@{ Command = 'Import'; Name = $Name })
+    }
+    foreach ($name in @('Protect-Text', 'Install-AzAccounts', 'Initialize-AzModule')) {
+        . ([scriptblock]::Create((Get-SourceFunction $name).Extent.Text))
+    }
+    $protocol = [Net.ServicePointManager]::SecurityProtocol
+    $failure = $null
+    try { Initialize-AzModule }
+    catch { $failure = $_.Exception.Message }
+    return [pscustomobject]@{ Calls = @($state.Calls.ToArray()); Error = $failure
+        ProtocolRestored = ([Net.ServicePointManager]::SecurityProtocol -eq $protocol) }
 }
 
 function Get-TestExportPath {
@@ -133,11 +243,12 @@ try {
     Invoke-Test 'Public comment-based help exposes the synopsis, switches, and complete invocation examples' {
         $help = Get-Help $scriptPath -Full
         Assert-True ([string]$help.Synopsis -match '^Reads Power Automate cloud-flow run history') 'Comment-based help was not discovered.'
-        Assert-Equal @($help.examples.example).Count 6
+        Assert-Equal @($help.examples.example).Count 7
         $examples = $help.examples.example | Out-String -Width 4096
         Assert-True ($examples -match '-Status Failed -LastDays 7 -Errors') 'The full example invocation was lost.'
         Assert-True ('CallingRecordId' -in $help.parameters.parameter.name) 'Public projection help is missing.'
         Assert-True ('CsvPath' -in $help.parameters.parameter.name -and 'JsonPath' -in $help.parameters.parameter.name) 'Export help is missing.'
+        Assert-True ('Cloud' -in $help.parameters.parameter.name -and 'SkipDependencyInstall' -in $help.parameters.parameter.name) 'Cloud/bootstrap help is missing.'
     }
 
     Invoke-Test 'Single flow summary, paged runs, no detail requests' {
@@ -523,6 +634,7 @@ try {
             $candidate -is [Management.Automation.Language.FunctionDefinitionAst] -and $candidate.Name -eq 'Assert-ContentUri'
         }, $true)
         $validator = $node.Body.GetScriptBlock()
+        $cloudProfile = & (Get-SourceFunction 'Get-CloudProfile').Body.GetScriptBlock() 'Public'
         $TestApiBaseUri = $null
         $apiBase = [uri]'https://api.flow.microsoft.com'
         $hostName = 'aaaaaaaaaaaaaaaaaaaaaaaaaa.05.environment.api.powerplatformusercontent.com'
@@ -675,7 +787,7 @@ try {
         Assert-Equal $none.Count 0
         Assert-Equal @(Import-Csv -LiteralPath $emptyCsv -Encoding UTF8).Count 0
         $header = [IO.File]::ReadAllText($emptyCsv).Trim()
-        Assert-True ($header.StartsWith('"RowType","TenantId","EnvironmentName","FlowId","FlowDisplayName","RunId"')) 'Stable header missing.'
+        Assert-True ($header.StartsWith('"RowType","TenantId","Cloud","EnvironmentName","FlowId","FlowDisplayName","RunId"')) 'Stable header missing.'
         Assert-True ($header -match '"MetadataJson"') 'Lossless metadata column missing.'
         Assert-Equal ([IO.File]::ReadAllText($emptyJson).Trim()) '[]'
         $csv = Get-TestExportPath 'csv'
@@ -889,6 +1001,7 @@ try {
         Assert-Equal $connect[0].Tenant $tenant
         Assert-Equal $connect[0].Environment 'AzureCloud'
         Assert-Equal $connect[0].Scope 'Process'
+        Assert-True $connect[0].SkipContextPopulation 'Sign-in still requires subscription enumeration.'
         $tokens = @($global:FlowHistoryAuthFixture.Calls | Where-Object Command -eq 'Token')
         Assert-True (@($tokens | Where-Object TenantId -ne $tenant).Count -eq 0) 'Token acquisition did not specify the target tenant.'
         Assert-True (@($tokens | Where-Object ResourceUrl -ne 'https://service.flow.microsoft.com/').Count -eq 0) 'Incorrect resource passed to Az.'
@@ -897,7 +1010,8 @@ try {
         foreach ($fixture in @(
             (New-AuthFixture -ContextTenant $otherTenant),
             (New-AuthFixture -AccountType 'ServicePrincipal'),
-            (New-AuthFixture -Cloud 'AzureUSGovernment')
+            (New-AuthFixture -Cloud 'AzureUSGovernment'),
+            (New-AuthFixture -Authority 'https://login.microsoftonline.us')
         )) {
             Set-Scenario
             $global:FlowHistoryAuthFixture = $fixture
@@ -909,6 +1023,189 @@ try {
         $global:FlowHistoryAuthFixture = New-AuthFixture
         Assert-Equal @(Invoke-History @{ FlowId = $flowA; UseExistingContext = $true } -WithoutToken).Count 5
         Assert-Equal @($global:FlowHistoryAuthFixture.Calls | Where-Object Command -eq 'Connect').Count 0
+    }
+    Invoke-Test 'GCC sign-in uses public Entra but a government Flow resource and preserves cloud in exports' {
+        Set-Scenario
+        $global:FlowHistoryAuthFixture = New-AuthFixture
+        $global:FlowHistoryAuthFixture.Token = New-TestToken -Audience 'https://gov.service.flow.microsoft.us/'
+        $csv = Get-TestExportPath 'csv'; $json = Get-TestExportPath 'json'
+        $items = @(Invoke-History @{ FlowId = $flowB; Cloud = 'GCC'; DeviceCode = $true
+            CallingRecordId = $true; RunId = 'b-failed'; CsvPath = $csv; JsonPath = $json } -WithoutToken)
+        Assert-Equal $items[0].Cloud 'GCC'
+        $calls = @($global:FlowHistoryAuthFixture.Calls | Where-Object Command -eq 'Connect')
+        Assert-Equal $calls[0].Environment 'AzureCloud'
+        Assert-True $calls[0].SkipContextPopulation 'GCC still enumerated subscriptions.'
+        Assert-True $calls[0].DeviceCode 'Device-code choice was not honored.'
+        $tokens = @($global:FlowHistoryAuthFixture.Calls | Where-Object Command -eq 'Token')
+        Assert-True (@($tokens | Where-Object ResourceUrl -ne 'https://gov.service.flow.microsoft.us/').Count -eq 0) 'GCC requested a commercial token.'
+        Assert-Equal (Import-Csv -LiteralPath $csv)[0].Cloud 'GCC'
+        Assert-Equal (Get-Content -LiteralPath $json -Raw | ConvertFrom-Json)[0].Cloud 'GCC'
+    }
+    Invoke-Test 'Public and GCC profiles select exact documented API and identity endpoints' {
+        $profile = (Get-SourceFunction 'Get-CloudProfile').Body.GetScriptBlock()
+        $gcc = & $profile 'gcc'
+        Assert-Equal $gcc.ApiBase 'https://gov.api.flow.microsoft.us'
+        Assert-Equal $gcc.Authority 'https://login.microsoftonline.com'
+        Assert-Equal $gcc.Audience 'https://gov.service.flow.microsoft.us/'
+        Assert-Equal $gcc.AzEnvironment 'AzureCloud'
+        Assert-Equal (& $profile 'Public').ApiBase 'https://api.flow.microsoft.com'
+        Set-Scenario
+        Assert-Throws { Invoke-History @{ Cloud = 'GCCHigh'; FlowId = $flowA } } 'ValidateSet|does not belong|Cannot validate'
+        Assert-Equal @(Get-Requests).Count 0
+    }
+    Invoke-Test 'Wrong cloud audience and foreign issuer are rejected before requests or installation' {
+        foreach ($case in @(
+            @{ Cloud = 'GCC'; AccessToken = New-TestToken },
+            @{ Cloud = 'Public'; AccessToken = (New-TestToken -Audience 'https://gov.service.flow.microsoft.us/') },
+            @{ Cloud = 'GCC'; AccessToken = (New-TestToken -Audience 'https://gov.service.flow.microsoft.us/' -Issuer "https://login.microsoftonline.us/$tenant/v2.0") },
+            @{ AccessToken = (New-TestToken -Issuer 'https://example.invalid/issuer') }
+        )) {
+            Set-Scenario
+            $case.FlowId = $flowA
+            Assert-Throws { Invoke-History $case } 'audience|issuer'
+            Assert-Equal @(Get-Requests).Count 0
+        }
+        Set-Scenario
+        Assert-Equal @(Invoke-History @{ FlowId = $flowA; AccessToken = (New-TestToken -Issuer "https://login.microsoftonline.com/$tenant/v2.0") }).Count 5
+    }
+    Invoke-Test 'GCC content downloads allow documented government hosts but reject commercial hosts and lookalikes' {
+        $cloudProfile = & (Get-SourceFunction 'Get-CloudProfile').Body.GetScriptBlock() 'GCC'
+        $validator = (Get-SourceFunction 'Assert-ContentUri').Body.GetScriptBlock()
+        $TestApiBaseUri = $null
+        foreach ($hostName in @('prod-1.usgovvirginia.logic.azure.us',
+            'env.api.gov.powerplatform.microsoft.us', 'gov.api.flow.microsoft.us', 'fixture.blob.core.usgovcloudapi.net')) {
+            & $validator ([uri]"https://$hostName/contents/payload?sig=fixture-secret")
+        }
+        foreach ($uri in @('https://prod.logic.azure.com/contents',
+            'https://env.api.powerplatform.com/contents', 'https://storage.blob.core.windows.net/contents',
+            'https://prod.logic.azure.us.evil.invalid/contents', 'http://prod.logic.azure.us/contents',
+            'https://prod.logic.azure.us:444/contents', 'https://user:password@prod.logic.azure.us/contents',
+            'https://env.api.high.powerplatform.microsoft.us/contents')) {
+            Assert-Throws { & $validator ([uri]$uri) } 'Content link|content link'
+        }
+    }
+    Invoke-Test 'GCC Dataverse metadata uses crm9 and its own token; wrong cloud org origins fail before HTTP' {
+        Set-Scenario
+        $gccToken = New-TestToken -Audience 'https://gov.service.flow.microsoft.us/'
+        $row = @(Invoke-History @{ FlowId = $flowA; RunId = 'run-failed'; Cloud = 'GCC'
+            AccessToken = $gccToken; CallingRecordId = $true; DataverseUrl = 'https://fixture.crm9.dynamics.com/'
+            DataverseAccessToken = (New-TestToken -Audience 'https://fixture.crm9.dynamics.com/') })[0]
+        Assert-Equal $row.CallingRecord.RecordId $rowId
+        Assert-Equal $row.Cloud 'GCC'
+        foreach ($case in @(
+            @{ Cloud = 'GCC'; AccessToken = $gccToken; DataverseUrl = 'https://fixture.crm.dynamics.com/' },
+            @{ DataverseUrl = 'https://fixture.crm9.dynamics.com/' },
+            @{ Cloud = 'GCC'; AccessToken = $gccToken; DataverseUrl = 'https://fixture.crm9.dynamics.com.evil.invalid/' }
+        )) {
+            Set-Scenario
+            $case.FlowId = $flowA
+            Assert-Throws { Invoke-History $case } 'selected cloud'
+            Assert-Equal @(Get-Requests).Count 0
+        }
+    }
+    Invoke-Test 'DeviceCode rejects conflicting token and context modes before sign-in' {
+        Set-Scenario
+        Assert-Throws { Invoke-History @{ FlowId = $flowA; DeviceCode = $true } } 'DeviceCode'
+        Assert-Throws { Invoke-History @{ FlowId = $flowA; DeviceCode = $true; UseExistingContext = $true } -WithoutToken } 'DeviceCode'
+        Assert-Equal @(Get-Requests).Count 0
+    }
+    Invoke-Test 'Automatic dependency install uses current-user PSResourceGet and PowerShellGet paths only when missing' {
+        foreach ($mode in @('PSResource', 'PowerShellGet')) {
+            $result = Invoke-DependencyFixture -Mode $mode -RepositoryMissing -NuGetMissing
+            Assert-Equal $result.Error $null
+            $installs = @($result.Calls | Where-Object Command -eq 'Install')
+            Assert-Equal $installs.Count 1
+            Assert-Equal $installs[0].Name 'Az.Accounts'
+            Assert-Equal $installs[0].Scope 'CurrentUser'
+            Assert-Equal $installs[0].Version '5.3.4'
+            Assert-Equal $installs[0].Repository 'PSGallery'
+            Assert-Equal @($result.Calls | Where-Object Command -eq 'Register').Count 1
+            Assert-Equal @($result.Calls | Where-Object Command -eq 'Import').Count 1
+            Assert-True $result.ProtocolRestored 'Bootstrap changed process TLS settings permanently.'
+            if ($mode -eq 'PowerShellGet') {
+                Assert-Equal @($result.Calls | Where-Object Command -eq 'NuGet')[0].Scope 'CurrentUser'
+            }
+            $installed = Invoke-DependencyFixture -Mode $mode -ModulePresent
+            Assert-Equal @($installed.Calls | Where-Object { $_.Command -in @('Install', 'Register', 'NuGet') }).Count 0
+        }
+    }
+    Invoke-Test 'Dependency opt-out, old loaded assemblies, install failures, and unavailable modules fail explicitly' {
+        foreach ($case in @(
+            @{ SkipInstall = $true; Pattern = 'SkipDependencyInstall' },
+            @{ OldLoaded = $true; Pattern = 'fresh PowerShell' },
+            @{ InstallFailure = $true; Pattern = 'Automatic.+failed' },
+            @{ InstallNoModule = $true; Pattern = 'did not produce' }
+        )) {
+            $pattern = $case.Pattern
+            $case.Remove('Pattern')
+            $result = Invoke-DependencyFixture @case
+            Assert-True ($result.Error -match $pattern) 'Bootstrap failure was suppressed.'
+            Assert-True $result.ProtocolRestored 'Failed install changed process TLS settings.'
+            Assert-Equal @($result.Calls | Where-Object Command -eq 'Import').Count 0
+        }
+        Invoke-Test 'Legacy PowerShellGet does not receive unsupported flags and absent installers fail explicitly' {
+            $legacy = Invoke-DependencyFixture -Mode PowerShellGet -OldPowerShellGet
+            Assert-Equal $legacy.Error $null
+            $install = @($legacy.Calls | Where-Object Command -eq 'Install')[0]
+            Assert-True (-not $install.AcceptLicense) 'Unsupported AcceptLicense was passed to legacy PowerShellGet.'
+            Assert-True $install.Force 'Legacy installation would prompt instead of proceeding.'
+            $missing = Invoke-DependencyFixture -Mode None
+            Assert-True ($missing.Error -match 'Neither PowerShellGet nor PSResourceGet') 'Missing installer was not actionable.'
+            Assert-Equal @($missing.Calls | Where-Object Command -eq 'Install').Count 0
+            Assert-True $missing.ProtocolRestored 'Installer detection changed TLS settings.'
+        }
+    }
+    Invoke-Test 'Automatic install will not trust hijacked galleries, untrusted custom repos or embedded credentials' {
+        foreach ($mode in @('PSResource', 'PowerShellGet')) {
+            foreach ($case in @(
+                @{ Source = 'https://example.invalid/api/v2' },
+                @{ Repository = 'PrivateRepo'; Source = 'https://example.invalid/api/v2' },
+                @{ Repository = 'PrivateRepo'; Source = 'http://example.invalid/api/v2'; Trusted = $true },
+                @{ Repository = 'PrivateRepo'; Source = 'https://user:secret@example.invalid/api/v2'; Trusted = $true },
+                @{ Repository = 'PrivateRepo'; RepositoryMissing = $true }
+            )) {
+                $result = Invoke-DependencyFixture -Mode $mode @case
+                Assert-True (-not [string]::IsNullOrEmpty($result.Error)) 'An unsafe repository was accepted.'
+                Assert-Equal @($result.Calls | Where-Object { $_.Command -in @('Install', 'Register', 'NuGet') }).Count 0
+            }
+            $allowed = Invoke-DependencyFixture -Mode $mode -Repository PrivateRepo -Source 'https://packages.example.invalid/approved' -Trusted $true
+            Assert-Equal $allowed.Error $null
+            Assert-Equal @($allowed.Calls | Where-Object Command -eq 'Install')[0].Repository 'PrivateRepo'
+        }
+    }
+    Invoke-Test 'Full payload and JSON exports preserve zero/one/many root arrays and timestamp strings on both engines' {
+        foreach ($count in @(0, 1, 2)) {
+            Set-Scenario "root-array-$count"
+            $json = Get-TestExportPath 'json'
+            $row = @(Invoke-History @{ FlowId = $flowA; RunId = 'run-failed'; All = $true; JsonPath = $json })[0]
+            $content = $row.Trigger.Outputs.Content
+            Assert-True ($content -is [array]) 'A root payload array collapsed into a scalar/null.'
+            Assert-Equal $content.Count $count
+            if ($count -gt 0) { Assert-Equal $content[0].date '2026-11-01T12:13:14.1234567+03:00' }
+            $text = [IO.File]::ReadAllText($json)
+            Assert-True ($text -match '"Content":\[') 'The structured export did not preserve a JSON array.'
+        }
+    }
+    Invoke-Test 'A non-object service response terminates rather than looking like empty successful history' {
+        Set-Scenario 'non-object-json'
+        Assert-Throws { Invoke-History @{ FlowId = $flowA } } 'JSON object'
+        Assert-Equal @(Get-Requests).Count 1
+    }
+    Invoke-Test 'Body read failures after HTTP 200 are retried rather than reported as successful HTTP failures' {
+        Set-Scenario 'retry-body-read'
+        $row = @(Invoke-History @{ FlowId = $flowA; RunId = 'run-failed'; CallingRecordId = $true
+            DataversePrimaryKey = @{ accounts = 'accountid' }; MaxRetries = 1 })[0]
+        Assert-Equal $row.CallingRecord.RecordId $rowId
+        Assert-Equal @(Get-Requests | Where-Object Path -eq '/content/dv-output').Count 2
+    }
+    Invoke-Test 'Explicit keys check canonical table identities even when runtime table metadata is absent' {
+        Set-Scenario 'canonical-map-conflict'
+        $row = @(Invoke-History @{ FlowId = $flowA; RunId = 'run-failed'; CallingRecordId = $true
+            DataversePrimaryKey = @{ accounts = 'accountid' } })[0]
+        Assert-Equal $row.CallingRecord.Availability 'Ambiguous'
+        Assert-Equal $row.CallingRecord.RecordId $null
+        Assert-Equal $row.DetailCoverage 'Partial'
+        Assert-True (@($row.Issues | Where-Object Component -eq 'CallingRecord').Count -gt 0) 'Record ambiguity was not visible in coverage.'
     }
     Invoke-Test 'Every feature request is read-only GET' {
         Set-Scenario
