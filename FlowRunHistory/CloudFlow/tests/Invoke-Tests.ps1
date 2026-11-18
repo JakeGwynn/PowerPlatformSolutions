@@ -1,6 +1,9 @@
 #Requires -Version 5.1
 [CmdletBinding()]
-param([string]$ResultsPath)
+param(
+    [string]$ResultsPath,
+    [ValidateSet('Public', 'GCC')][string]$Cloud = 'Public'
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -8,7 +11,11 @@ $generator = Join-Path $PSScriptRoot '..\New-FlowHistoryCollector.ps1'
 $parameters = @{
     TenantId = '11111111-1111-4111-8111-111111111111'
     SharePointSiteUrl = 'https://contoso.sharepoint.com/sites/Test'
+    Cloud = $Cloud
 }
+$expectedCloud = if ($Cloud -eq 'GCC') { 'GCC' } else { 'Public' }
+$expectedApiBase = if ($Cloud -eq 'GCC') { 'https://gov.api.flow.microsoft.us' } else { 'https://api.flow.microsoft.com' }
+$otherApiBase = if ($Cloud -eq 'GCC') { 'https://api.flow.microsoft.com' } else { 'https://gov.api.flow.microsoft.us' }
 $package = & $generator @parameters
 $actions = @{}
 $expressions = [Collections.Generic.List[string]]::new()
@@ -371,8 +378,8 @@ Test-Case 'CallingRecordId queues no action collection and payload mode distingu
 Test-Case 'Content origin guard accepts Microsoft storage and rejects lookalikes, ports and credentials' {
     $c = Context; $c.Variables.CurrentWork = @{}
     foreach ($test in @(
-        @('https://prod.logic.azure.com/workflows/x?sig=secret', $true),
-        @('https://abcd.05.environment.api.powerplatformusercontent.com/storage/powerautomate/automations/x?sig=secret', $true),
+        @('https://prod.logic.azure.com/workflows/x?sig=secret', ($Cloud -eq 'Public')),
+        @('https://abcd.05.environment.api.powerplatformusercontent.com/storage/powerautomate/automations/x?sig=secret', ($Cloud -eq 'Public')),
         @('https://prod.logic.azure.com.evil.invalid/x?sig=secret', $false),
         @('https://abcd.05.environment.api.powerplatformusercontent.com/elsewhere', $false),
         @('http://prod.logic.azure.com/x', $false), @('https://prod.logic.azure.com:444/x', $false),
@@ -654,13 +661,207 @@ Test-Case 'Generator refuses an existing output artifact and never invokes tenan
     Assert ($text -notmatch 'Invoke-RestMethod|Connect-AzAccount|create_flow|publish_flow|run_flow') 'Offline generator performs live operations.'
 }
 
+Test-Case 'Cloud routing and connection metadata align with the existing reader profiles without a live context' {
+    $reader = Join-Path $PSScriptRoot '..\..\Get-FlowRunHistory.ps1'
+    $tokens = $null; $parseErrors = $null
+    $ast = [Management.Automation.Language.Parser]::ParseFile($reader, [ref]$tokens, [ref]$parseErrors)
+    Assert (@($parseErrors).Count -eq 0) 'Reader profile source does not parse.'
+    $profileFunction = $ast.Find({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Get-CloudProfile'
+    }, $true)
+    Assert ($null -ne $profileFunction) 'Reader cloud-profile prior art was not found.'
+    $profile = & $profileFunction.Body.GetScriptBlock() $Cloud
+    Assert ($package.targetCloud -ceq $expectedCloud -and $package.targetCloud -ceq $profile.Name) 'Generated package cloud does not match the selected profile.'
+    Assert ($package.deployment.requiredFlowBase -ceq $expectedApiBase -and $package.deployment.requiredFlowBase -ceq $profile.ApiBase) 'API host differs from the verified reader mapping.'
+    Assert ($package.deployment.requiredFlowResource -ceq $profile.Audience -and $profile.Audience.EndsWith('/')) 'Flow resource/audience or mandatory trailing slash changed.'
+    Assert ($package.deployment.requiredIdentityAuthority -ceq 'https://login.microsoftonline.com' -and
+        $package.deployment.requiredIdentityAuthority -ceq $profile.Authority) 'Standard GCC must not switch to government Entra identity.'
+    Assert ($package.deployment.requiredIdentityEnvironment -ceq 'AzureCloud' -and
+        $package.deployment.requiredIdentityEnvironment -ceq $profile.AzEnvironment) 'Standard GCC must not use AzureUSGovernment identity.'
+    Assert (@(Compare-Object @($package.deployment.contentHostSuffixes | Sort-Object) @($profile.ContentSuffixes | Sort-Object)).Count -eq 0) 'Native anonymous content families drifted from the reader.'
+    Assert ($package.deployment.publicUserContentStorageAllowed -eq ($Cloud -eq 'Public')) 'Commercial user-content storage must not be guessed for GCC.'
+    Assert ($package.deployment.gccBestEffortOfflineOnly -eq ($Cloud -eq 'GCC')) 'Best-effort/offline-only GCC scope is not explicit.'
+    Assert (-not $package.definition.triggers.manual.inputs.schema.properties.Contains('Cloud')) 'Runtime user input must not switch a bound connection between clouds.'
+    foreach ($reference in $package.connectionReferences.Values) { Assert ($reference.source -ceq 'Embedded') 'Cloud selection altered the verified Embedded binding contract.' }
+}
+Test-Case 'Every generated self, discovery, run, action and repetition route stays on the selected API origin' {
+    $c = Context
+    $c.Variables.EnvironmentId = 'scan-environment'
+    $c.Variables.FlowIds = @('flow-selected'); $c.Variables.RunIds = @('run-selected')
+    $c.Variables.CurrentWork = @{
+        FlowId = 'flow-from-page'; RunId = 'run-from-page'; OperationName = 'Nested action/with?reserved'
+        Uri = "$expectedApiBase/providers/Microsoft.ProcessSimple/environments/scan-environment/flows/flow-from-page/runs/run-from-page?api-version=2016-11-01"
+    }
+    $c.Outputs.FlowPage_item = @{ name = 'flow-discovered' }
+    $c.Outputs.RunPage_item = @{ name = 'run-discovered' }
+    $c.Outputs.ActionPage_item = @{ name = 'Action/from?collection' }
+    $c.Outputs.Run_filter_query = '&$filter=status%20eq%20%27Failed%27'
+    $c.Items.For_each_explicit_flow = 0; $c.Items.For_each_explicit_run = 0
+    $c.Variables.Root = Evaluate $actions.Set_api_root.inputs.value $c
+    Assert ($c.Variables.Root -ceq "$expectedApiBase/providers/Microsoft.ProcessSimple/environments/scan-environment") 'Non-admin root is not cloud specific.'
+    $own = Evaluate $actions.Resolve_collector_identity.inputs.parameters['request/url'] $c
+    Assert ($own -ceq "$expectedApiBase/providers/Microsoft.ProcessSimple/environments/fixture-environment/flows/33333333-3333-4333-8333-333333333333?api-version=2016-11-01") 'Own identity resolution switched cloud or used the scan override.'
+    foreach ($admin in @($false, $true)) {
+        $c.Trigger.AsAdmin = $admin
+        $c.Variables.Root = Evaluate $actions.Set_api_root.inputs.value $c
+        foreach ($name in @('Queue_flow_discovery_append', 'Queue_shared_discovery_append',
+            'Queue_explicit_run_append', 'Queue_explicit_flow_runs_append', 'Queue_discovered_history_append',
+            'Queue_discovered_run_detail_append', 'ActionPage_queue_operation_append',
+            'Repetitions_queue_operation_append', 'Queue_trigger_operation_append', 'Queue_run_expansion_append',
+            'Queue_run_actions_append', 'Queue_selected_payload_append')) {
+            $uri = [uri](Evaluate $actions[$name].inputs.value.Uri $c)
+            Assert ($uri.GetLeftPart([UriPartial]::Authority) -ceq $expectedApiBase) "$name escaped the selected cloud."
+            Assert ($uri.Scheme -ceq 'https' -and $uri.Port -eq 443 -and -not $uri.UserInfo) "$name does not use a credential-free HTTPS API selector."
+            Assert ($uri.AbsolutePath.Contains('/environments/scan-environment/')) "$name lost environment association."
+        }
+        $discovery = Evaluate $actions.Queue_flow_discovery_append.inputs.value.Uri $c
+        Assert ($discovery.Contains('/scopes/admin/') -eq $admin) 'Admin discovery root changed.'
+        Assert ($discovery.Contains('/v2/flows') -eq $admin) 'Admin v2 discovery contract changed.'
+    }
+    foreach ($index in @(0, 1)) {
+        $c.Items.For_each_repetition_kind = $index
+        $uri = Evaluate $actions.Queue_operation_repetitions_append.inputs.value.Uri $c
+        Assert (([uri]$uri).GetLeftPart([UriPartial]::Authority) -ceq $expectedApiBase) 'Repetition expansion switched clouds.'
+        $kind = @('repetitions', 'scopeRepetitions')[$index]
+        Assert ($uri.EndsWith("/$kind`?api-version=2016-11-01") -and $uri.Contains('Nested%20action%2Fwith%3Freserved')) 'Repetition kind/name encoding changed.'
+    }
+    $actualRequest = Evaluate $actions.Read_Flow_API.inputs.parameters['request/url'] $c
+    Assert ($actualRequest -ceq $c.Variables.CurrentWork.Uri) 'HTTP connector does not use the cloud-scoped queue selector.'
+    $definitionText = ConvertTo-Json -InputObject $package.definition -Depth 100 -Compress
+    Assert (-not $definitionText.Contains($otherApiBase)) 'Generated definition still contains a wrong-cloud API literal.'
+}
+Test-Case 'Authenticated guards reject wrong-cloud, lookalike, credential, fragment, insecure and foreign-environment URLs' {
+    $c = Context; $c.Variables.EnvironmentId = 'scan-environment'; $c.Variables.Visited = @()
+    $path = '/providers/Microsoft.ProcessSimple/environments/scan-environment/flows/flow/runs'
+    $c.Variables.CurrentWork = @{ Kind = 'RunPage'; Uri = '' }
+    foreach ($test in @(
+        @("$expectedApiBase$path`?api-version=2016-11-01", $true),
+        @("$expectedApiBase/providers/Microsoft.ProcessSimple/scopes/admin/environments/scan-environment/flows/flow/runs", $true),
+        @("$otherApiBase$path", $false),
+        @("$expectedApiBase.evil.invalid$path", $false),
+        @("http://$(([uri]$expectedApiBase).Host)$path", $false),
+        @("$expectedApiBase`:444$path", $false),
+        @("https://user:password@$(([uri]$expectedApiBase).Host)$path", $false),
+        @("$expectedApiBase$path#fragment", $false),
+        @("$expectedApiBase/providers/Microsoft.ProcessSimple/environments/scan-environment-other/flows/flow/runs", $false),
+        @("https://high.api.flow.microsoft.us$path", $false),
+        @("https://api.flow.appsplatform.us$path", $false)
+    )) {
+        $c.Variables.CurrentWork.Uri = $test[0]
+        Assert ((Evaluate $actions.Guard_authenticated_origin.expression.equals[0] $c) -eq $test[1]) "Authenticated origin guard failed: $($test[0])"
+    }
+    $uri = "$expectedApiBase$path"
+    $c.Variables.CurrentWork.Uri = $uri; $c.Variables.Visited = @($uri)
+    Assert (-not [bool](Evaluate $actions.Guard_authenticated_origin.expression.equals[0] $c)) 'Repeated collection is not bounded.'
+    $c.Variables.CurrentWork.Kind = 'Payload'
+    Assert ([bool](Evaluate $actions.Guard_authenticated_origin.expression.equals[0] $c)) 'Legitimate same-cloud payload metadata refetch was blocked as a paging cycle.'
+}
+Test-Case 'Absolute, root-relative and query-relative paging is cloud scoped on every collection' {
+    $c = Context; $c.Variables.EnvironmentId = 'scan-environment'; $c.Variables.Visited = @()
+    foreach ($kind in @('FlowPage','RunPage','ActionPage','Repetitions')) {
+        $path = '/providers/Microsoft.ProcessSimple/environments/scan-environment/flows'
+        if ($kind -eq 'RunPage') { $path += '/flow/runs' }
+        if ($kind -eq 'ActionPage') { $path += '/flow/runs/run/actions' }
+        if ($kind -eq 'Repetitions') { $path += '/flow/runs/run/actions/action/repetitions' }
+        $c.Variables.CurrentWork = @{ Kind = $kind; Uri = "$expectedApiBase$path`?api-version=2016-11-01" }
+        foreach ($next in @("$expectedApiBase$path`?page=2", "$path`?page=2", '?page=2')) {
+            $c.Outputs.Current_response_body = @{ nextLink = $next }
+            $resolved = Evaluate $actions[$kind + '_next_uri'].inputs $c
+            Assert ($resolved -ceq "$expectedApiBase$path`?page=2") "$kind paging resolved against the wrong cloud."
+            $c.Outputs[$kind + '_next_uri'] = $resolved
+            Assert ([bool](Evaluate $actions[$kind + '_same_collection'].expression.equals[0] $c)) "$kind rejected valid same-cloud paging."
+        }
+        $c.Outputs.Current_response_body = @{ '@odata.nextLink' = '?page=3' }
+        Assert ((Evaluate $actions[$kind + '_next_uri'].inputs $c) -ceq "$expectedApiBase$path`?page=3") "$kind lost @odata.nextLink support."
+        foreach ($next in @("$otherApiBase$path`?page=2", "$expectedApiBase.evil.invalid$path`?page=2",
+            "$expectedApiBase`:444$path", "https://user:pass@$(([uri]$expectedApiBase).Host)$path",
+            "http://$(([uri]$expectedApiBase).Host)$path", "$expectedApiBase$path#fragment",
+            "$expectedApiBase/another-collection", "$expectedApiBase$path`?sig=secret", "$expectedApiBase$path`?access_token=secret")) {
+            $c.Outputs.Current_response_body = @{ nextLink = $next }
+            $c.Outputs[$kind + '_next_uri'] = Evaluate $actions[$kind + '_next_uri'].inputs $c
+            Assert (-not [bool](Evaluate $actions[$kind + '_same_collection'].expression.equals[0] $c)) "$kind admitted unsafe paging: $next"
+        }
+    }
+}
+Test-Case 'Anonymous content hosts are selected-cloud only with fail-closed unknown government storage' {
+    $c = Context
+    foreach ($test in @(
+        @('https://prod-01.usgovvirginia.logic.azure.us/workflows/x?sig=secret', 'GCC'),
+        @('https://env.api.gov.powerplatform.microsoft.us/storage/x?sig=secret', 'GCC'),
+        @('https://gov.api.flow.microsoft.us/storage/x?sig=secret', 'GCC'),
+        @('https://account.blob.core.usgovcloudapi.net/container/x?sig=secret', 'GCC'),
+        @('https://prod-01.westus.logic.azure.com/workflows/x?sig=secret', 'Public'),
+        @('https://env.api.powerplatform.com/storage/x?sig=secret', 'Public'),
+        @('https://api.flow.microsoft.com/storage/x?sig=secret', 'Public'),
+        @('https://account.blob.core.windows.net/container/x?sig=secret', 'Public'),
+        @('https://abcd.05.environment.api.powerplatformusercontent.com/storage/powerautomate/automations/x?sig=secret', 'Public')
+    )) {
+        $c.Outputs.Payload_link_uri = $test[0]
+        Assert ((Evaluate $actions.Guard_anonymous_content_origin.expression.equals[0] $c) -eq ($test[1] -eq $expectedCloud)) "Content origin crossed clouds: $($test[0])"
+    }
+    foreach ($uri in @(
+        'https://logic.azure.us.evil.invalid/x?sig=secret', 'https://evilgov.api.flow.microsoft.us/x?sig=secret',
+        'https://example.microsoft.us/x?sig=secret', 'https://env.api.high.powerplatform.microsoft.us/x?sig=secret',
+        'https://high.api.flow.microsoft.us/x?sig=secret', 'https://api.flow.appsplatform.us/x?sig=secret',
+        'https://env.gov.powerplatformusercontent.mi/storage/x?sig=secret',
+        'https://abcd.environment.api.gov.powerplatformusercontent.microsoft.us/storage/powerautomate/automations/x?sig=secret',
+        'http://prod.logic.azure.us/x?sig=secret', 'https://prod.logic.azure.us:444/x?sig=secret',
+        'https://user:pass@prod.logic.azure.us/x?sig=secret', 'https://prod.logic.azure.us/x?sig=secret#fragment',
+        'https://user:pass@prod.logic.azure.com/x?sig=secret', 'https://prod.logic.azure.com/x?sig=secret#fragment'
+    )) {
+        $c.Outputs.Payload_link_uri = $uri
+        Assert (-not [bool](Evaluate $actions.Guard_anonymous_content_origin.expression.equals[0] $c)) "Unsafe/undocumented content host was accepted: $uri"
+    }
+    Assert ($actions.Mark_blocked_content.inputs.value.Availability -ceq 'BlockedHost') 'Unknown origins do not produce explicit unavailability.'
+    Assert (-not $actions.Read_signed_payload_anonymously.inputs.Contains('authentication') -and
+        -not $actions.Read_signed_payload_anonymously.inputs.Contains('headers')) 'Cloud selection added authenticated content download.'
+}
+Test-Case 'Manifest cloud and cloud-independent record/projection behavior remain explicit' {
+    Assert ($actions.Compose_report_manifest.inputs.Cloud -ceq $expectedCloud) 'Report manifest mislabels the generated cloud.'
+    Assert ($actions.Respond_to_parent.inputs.body.mode -ceq "@variables('Mode')") 'Cloud routing changed completion mode metadata.'
+    Assert ($actions.Create_minimal_CSV_table.inputs.columns.Count -eq 1) 'GCC added context to minimal ID-only CSV.'
+    $c = Context
+    $c.Outputs.Private_trigger_object = @{
+        host = @{ apiId = '/providers/Microsoft.PowerApps/apis/shared_commondataserviceforapps'; operationId = 'SubscribeWebhookTrigger' }
+    }
+    $suffix = Evaluate $actions.Safe_trigger_fields.inputs.ApiName $c
+    $c.Outputs.Runtime_connector_name = $suffix
+    Assert ((Evaluate $actions.Choose_record_connector.expression $c) -ceq 'dataverse') 'Cloud selection broke exact primary-record connector matching.'
+    $id = '12345678-1234-4234-8234-123456789abc'
+    foreach ($hostName in @('org.crm.dynamics.com','org.crm9.dynamics.com')) {
+        $c.Outputs.Private_canonical_identity = "https://$hostName/api/data/v9.2/accounts($id)"
+        Assert ((Evaluate $actions.Private_canonical_candidate.inputs $c) -ceq $id) 'Canonical ID parsing became incorrectly coupled to an API hostname.'
+    }
+    $c.Outputs.Runtime_connector_name = 'commondataserviceforapps'
+    Assert ((Evaluate $actions.Choose_record_connector.expression $c) -ceq 'dataverse') 'Bare legacy Dataverse name changed across clouds.'
+    $c.Outputs.Runtime_connector_name = 'sharepointonline'
+    Assert ((Evaluate $actions.Choose_record_connector.expression $c) -ceq 'shared_sharepointonline') 'Bare legacy SharePoint name changed across clouds.'
+}
+Test-Case 'Public is the unchanged default choice and unimplemented sovereign clouds fail before generation' {
+    $defaultParameters = @{} + $parameters
+    $defaultParameters.Remove('Cloud')
+    $defaultPackage = & $generator @defaultParameters
+    $explicitPackage = & $generator @defaultParameters -Cloud Public
+    Assert ($defaultPackage.targetCloud -ceq 'Public') 'Default cloud changed from Public.'
+    Assert ((ConvertTo-Json -InputObject $defaultPackage.definition -Compress -Depth 100) -ceq
+        (ConvertTo-Json -InputObject $explicitPackage.definition -Compress -Depth 100)) 'Default versus explicit Public definitions differ.'
+    foreach ($unsupported in @('GCCHigh', 'DoD', 'China', 'AzureUSGovernment')) {
+        $caught = $false
+        try { $null = & $generator @defaultParameters -Cloud $unsupported }
+        catch [Management.Automation.ParameterBindingException] { $caught = $true }
+        Assert $caught 'Unimplemented cloud silently fell back to Public or GCC.'
+    }
+}
+
 $failed = @($results | Where-Object { -not $_.Passed })
 $report = @{
     Engine = $PSVersionTable.PSVersion.ToString(); Passed = $results.Count - $failed.Count; Failed = $failed.Count
+    Cloud = $expectedCloud
     ActionCount = $actions.Count; MaxNesting = $maxDepth; ExpressionCount = $expressions.Count
     Scope = 'Offline structural and generated-expression fixtures; not a native runtime emulator or a live tenant test.'
     Tests = $results.ToArray()
 }
 if ($ResultsPath) { $report | ConvertTo-Json -Depth 15 | Set-Content -LiteralPath $ResultsPath -Encoding UTF8 }
-Write-Host "PowerShell $($report.Engine): $($report.Passed) passed, $($report.Failed) failed; $($report.ActionCount) actions, nesting $maxDepth."
+Write-Host "PowerShell $($report.Engine), $($report.Cloud): $($report.Passed) passed, $($report.Failed) failed; $($report.ActionCount) actions, nesting $maxDepth."
 if ($failed.Count -gt 0) { exit 1 }

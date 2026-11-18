@@ -10,7 +10,8 @@ and offline tests; no live GCC tenant was available.
 For the **native Power Automate counterpart**, see the
 [cloud-flow collector guide](CloudFlow/README.md). It covers the portable
 generator, native test driver, offline tests, JSON/CSV report packages, and the
-Public-cloud premium-connector, run-history privacy and observed runtime limits.
+Public/default plus **best-effort standard GCC** generation option (GCC is not
+live-tested). Premium-connector, run-history privacy and observed runtime limits apply.
 No performance equivalence to the PowerShell reader is claimed.
 
 ## Quick start

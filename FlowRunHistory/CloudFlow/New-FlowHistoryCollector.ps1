@@ -7,10 +7,17 @@ Generates a portable, stopped native Power Automate flow-history collector.
 .DESCRIPTION
 Offline generator only. Does not authenticate, install dependencies, deploy,
 enable, run or change connections. See README.md for manual input, connection,
-security, coverage and native runtime limitations.
+security, coverage and native runtime limitations. Public is the default.
+Standard GCC (Moderate) generation is best-effort/documentation and offline
+fixture validated, not live-tested or platform-certified.
 
 .PARAMETER TenantId
 Explicit tenant of the independently verified Embedded connections.
+
+.PARAMETER Cloud
+Public (default) or standard GCC (Moderate). Fixed at generation, not a runtime
+tenant/connection switch. Both use public Entra/AzureCloud. GCC High, DoD and
+China are not included.
 
 .PARAMETER SharePointSiteUrl
 Approved HTTPS export site. The report folder must already exist.
@@ -20,18 +27,24 @@ Site-relative library/folder path. Default /Shared Documents/FlowRunHistory.
 
 .PARAMETER WebContentsConnectionName
 Dedicated preauthorized connection with resource https://service.flow.microsoft.com/
-and base https://api.flow.microsoft.com, not a PPAPI connection.
+and base https://api.flow.microsoft.com for Public. GCC requires resource
+https://gov.service.flow.microsoft.us/ and base https://gov.api.flow.microsoft.us.
+Use a same-target-tenant Embedded connection, not a PPAPI connection.
 
 .PARAMETER SharePointConnectionName
 An independently verified connection authorized for the approved report folder.
 
 .PARAMETER OutputPath
 Optional new package file. Existing files are never overwritten.
+
+.EXAMPLE
+.\New-FlowHistoryCollector.ps1 -Cloud GCC -TenantId $tenant -SharePointSiteUrl 'https://YOUR-TENANT.sharepoint.com/sites/Reports' -OutputPath "$env:TEMP\collector-gcc.json"
 #>
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][guid]$TenantId,
     [Parameter(Mandatory)][uri]$SharePointSiteUrl,
+    [ValidateSet('Public', 'GCC')][string]$Cloud = 'Public',
     [string]$ReportFolderPath = '/Shared Documents/FlowRunHistory',
     [string]$WebContentsConnectionName = 'REPLACE_WITH_VERIFIED_FLOW_CONNECTION',
     [string]$SharePointConnectionName = 'REPLACE_WITH_VERIFIED_SHAREPOINT_CONNECTION',
@@ -52,6 +65,24 @@ if ($ReportFolderPath -notmatch '^/[^?#\\]+$' -or $ReportFolderPath.Contains("'"
 foreach ($binding in @($WebContentsConnectionName, $SharePointConnectionName)) {
     if ($binding -notmatch '^[A-Za-z0-9_-]+$') { throw 'Connection names must be connection identifiers.' }
 }
+# Keep endpoint/content families aligned with Get-CloudProfile in the reader.
+$cloudProfile = if ($Cloud -eq 'GCC') {
+    [pscustomobject]@{
+        Name = 'GCC'; AzEnvironment = 'AzureCloud'; Authority = 'https://login.microsoftonline.com'
+        ApiBase = 'https://gov.api.flow.microsoft.us'; Audience = 'https://gov.service.flow.microsoft.us/'
+        ContentSuffixes = @('logic.azure.us', 'api.gov.powerplatform.microsoft.us',
+            'gov.api.flow.microsoft.us', 'blob.core.usgovcloudapi.net')
+    }
+}
+else {
+    [pscustomobject]@{
+        Name = 'Public'; AzEnvironment = 'AzureCloud'; Authority = 'https://login.microsoftonline.com'
+        ApiBase = 'https://api.flow.microsoft.com'; Audience = 'https://service.flow.microsoft.com/'
+        ContentSuffixes = @('logic.azure.com', 'api.powerplatform.com', 'flow.microsoft.com', 'blob.core.windows.net')
+    }
+}
+$apiBase = $cloudProfile.ApiBase
+$apiHost = ([uri]$apiBase).DnsSafeHost
 $site = $SharePointSiteUrl.AbsoluteUri.TrimEnd('/')
 $emptyObject = "@json('{}')"
 $emptyArray = "@json('[]')"
@@ -257,7 +288,7 @@ $actions.Validate_utc_window.else = @{ actions = @{
         code = 'InvalidUTCWindow'; message = 'FromUtc must precede ToUtc. Explicit boundaries must be valid ISO UTC timestamps ending in Z.'
     } }; runAfter = @{} }
 } }
-Set-Value $actions 'Set_api_root' 'Root' "@concat('https://api.flow.microsoft.com/providers/Microsoft.ProcessSimple/',if(equals(coalesce(triggerBody()?['AsAdmin'],false),true),'scopes/admin/',''),'environments/',uriComponent(variables('EnvironmentId')))"
+Set-Value $actions 'Set_api_root' 'Root' "@concat('$apiBase/providers/Microsoft.ProcessSimple/',if(equals(coalesce(triggerBody()?['AsAdmin'],false),true),'scopes/admin/',''),'environments/',uriComponent(variables('EnvironmentId')))"
 $firstStatus = "first(union(variables('Statuses'),createArray('')))"
 $statusLiteral = "if(equals($firstStatus,'failed'),'Failed',if(equals($firstStatus,'succeeded'),'Succeeded',if(equals($firstStatus,'cancelled'),'Cancelled','Running')))"
 Step $actions 'Candidate_run_filters' 'Compose' @(
@@ -274,7 +305,7 @@ Step $actions 'Resolve_collector_identity' 'OpenApiConnection' @{
     host = @{ apiId = '/providers/Microsoft.PowerApps/apis/shared_webcontents'; connectionName = 'shared_webcontents'; operationId = 'InvokeHttp' }
     parameters = @{
         'request/method' = 'GET'
-        'request/url' = "@concat('https://api.flow.microsoft.com/providers/Microsoft.ProcessSimple/environments/',uriComponent(workflow()?['tags']?['environmentName']),'/flows/',uriComponent(last(split(workflow()?['name'],'/'))),'?api-version=2016-11-01')"
+        'request/url' = "@concat('$apiBase/providers/Microsoft.ProcessSimple/environments/',uriComponent(workflow()?['tags']?['environmentName']),'/flows/',uriComponent(last(split(workflow()?['name'],'/'))),'?api-version=2016-11-01')"
     }
     retryPolicy = @{ type = 'exponential'; count = 4; interval = 'PT5S' }
 }
@@ -296,7 +327,7 @@ $seedRuns = [ordered]@{}
 Enqueue $seedRuns 'Queue_explicit_run' ([ordered]@{
     Kind = 'RunDetail'; FlowId = "@variables('FlowIds')[items('For_each_explicit_flow')]"
     FlowDisplayName = ''; RunId = "@variables('RunIds')[items('For_each_explicit_run')]"
-    Uri = "@concat('https://api.flow.microsoft.com/providers/Microsoft.ProcessSimple/environments/',uriComponent(variables('EnvironmentId')),'/flows/',uriComponent(variables('FlowIds')[items('For_each_explicit_flow')]),'/runs/',uriComponent(variables('RunIds')[items('For_each_explicit_run')]),'?api-version=2016-11-01')"
+    Uri = "@concat('$apiBase/providers/Microsoft.ProcessSimple/environments/',uriComponent(variables('EnvironmentId')),'/flows/',uriComponent(variables('FlowIds')[items('For_each_explicit_flow')]),'/runs/',uriComponent(variables('RunIds')[items('For_each_explicit_run')]),'?api-version=2016-11-01')"
 })
 $runSeed = [ordered]@{}
 Each-Index $runSeed 'For_each_explicit_run' "variables('RunIds')" $seedRuns
@@ -346,7 +377,7 @@ Condition $remote 'Remember_collection_visit' "@contains(createArray('FlowPage',
 $blockedRemote = [ordered]@{}
 Issue $blockedRemote 'Issue_blocked_api_url' 'BlockedOrRepeatedApiUri' 'Authenticated request rejected: URI must be an unvisited HTTPS Flow API read in the selected environment.'
 $remoteGuard = [ordered]@{}
-$apiGuard = "@and(equals(uriScheme(variables('CurrentWork')?['Uri']),'https'),equals(toLower(uriHost(variables('CurrentWork')?['Uri'])),'api.flow.microsoft.com'),equals(uriPort(variables('CurrentWork')?['Uri']),443),or(startsWith(uriPath(variables('CurrentWork')?['Uri']),concat('/providers/Microsoft.ProcessSimple/environments/',uriComponent(variables('EnvironmentId')),'/')),startsWith(uriPath(variables('CurrentWork')?['Uri']),concat('/providers/Microsoft.ProcessSimple/scopes/admin/environments/',uriComponent(variables('EnvironmentId')),'/'))),or(contains(createArray('RunExpansion','Operation','Payload'),variables('CurrentWork')?['Kind']),not(contains(variables('Visited'),variables('CurrentWork')?['Uri']))))"
+$apiGuard = "@and(equals(uriScheme(variables('CurrentWork')?['Uri']),'https'),equals(toLower(uriHost(variables('CurrentWork')?['Uri'])),'$apiHost'),equals(uriPort(variables('CurrentWork')?['Uri']),443),not(contains(variables('CurrentWork')?['Uri'],'@')),not(contains(variables('CurrentWork')?['Uri'],'#')),or(startsWith(uriPath(variables('CurrentWork')?['Uri']),concat('/providers/Microsoft.ProcessSimple/environments/',uriComponent(variables('EnvironmentId')),'/')),startsWith(uriPath(variables('CurrentWork')?['Uri']),concat('/providers/Microsoft.ProcessSimple/scopes/admin/environments/',uriComponent(variables('EnvironmentId')),'/'))),or(contains(createArray('RunExpansion','Operation','Payload'),variables('CurrentWork')?['Kind']),not(contains(variables('Visited'),variables('CurrentWork')?['Uri']))))"
 Condition $remoteGuard 'Guard_authenticated_origin' $apiGuard $remote $blockedRemote
 $inlineRun = [ordered]@{}
 Set-Value $inlineRun 'Store_inline_run_summary' 'ResponseState' @{
@@ -411,7 +442,7 @@ function Page-Branch {
                 }
             }
             FlowDisplayName = "@coalesce(variables('CurrentWork')?['FlowDisplayName'],'')"; RunId = "@$item`?['name']"
-            Uri = "@concat('https://api.flow.microsoft.com/providers/Microsoft.ProcessSimple/environments/',uriComponent(variables('EnvironmentId')),'/flows/',uriComponent(variables('CurrentWork')?['FlowId']),'/runs/',uriComponent($item`?['name']),'?api-version=2016-11-01')"
+            Uri = "@concat('$apiBase/providers/Microsoft.ProcessSimple/environments/',uriComponent(variables('EnvironmentId')),'/flows/',uriComponent(variables('CurrentWork')?['FlowId']),'/runs/',uriComponent($item`?['name']),'?api-version=2016-11-01')"
         }
         $matched = [ordered]@{}
         Append-Value $matched 'Remember_discovered_requested_run' 'MatchedRunIds' "@$item`?['name']"
@@ -426,7 +457,7 @@ function Page-Branch {
             OperationType = $(if ($Kind -eq 'ActionPage') { 'Action' } else { "@variables('CurrentWork')?['OperationType']" })
             RepetitionName = $(if ($Kind -eq 'ActionPage') { '' } else { "@$item`?['name']" })
             Uri = $(if ($Kind -eq 'ActionPage') {
-                "@concat('https://api.flow.microsoft.com/providers/Microsoft.ProcessSimple/environments/',uriComponent(variables('EnvironmentId')),'/flows/',uriComponent(variables('CurrentWork')?['FlowId']),'/runs/',uriComponent(variables('CurrentWork')?['RunId']),'/actions/',uriComponent($item`?['name']),'?api-version=2016-11-01')"
+                "@concat('$apiBase/providers/Microsoft.ProcessSimple/environments/',uriComponent(variables('EnvironmentId')),'/flows/',uriComponent(variables('CurrentWork')?['FlowId']),'/runs/',uriComponent(variables('CurrentWork')?['RunId']),'/actions/',uriComponent($item`?['name']),'?api-version=2016-11-01')"
             } else { "@variables('CurrentWork')?['Uri']" })
         }
     }
@@ -434,9 +465,9 @@ function Page-Branch {
     $page = [ordered]@{}
     Enqueue $page ($Kind + '_queue_next_page') "@setProperty(variables('CurrentWork'),'Uri',outputs('$Kind`_next_uri'))"
     $next = "coalesce(outputs('Current_response_body')?['nextLink'],outputs('Current_response_body')?['@odata.nextLink'],'')"
-    Step $good ($Kind + '_next_uri') 'Compose' "@if(startsWith($next,'/'),concat('https://api.flow.microsoft.com',$next),if(startsWith($next,'?'),concat('https://api.flow.microsoft.com',uriPath(variables('CurrentWork')?['Uri']),$next),$next))"
+    Step $good ($Kind + '_next_uri') 'Compose' "@if(startsWith($next,'/'),concat('$apiBase',$next),if(startsWith($next,'?'),concat('$apiBase',uriPath(variables('CurrentWork')?['Uri']),$next),$next))"
     $nextSafe = "not(or(contains(toLower(outputs('$Kind`_next_uri')),'?sig='),contains(toLower(outputs('$Kind`_next_uri')),'&sig='),contains(toLower(outputs('$Kind`_next_uri')),'?access_token='),contains(toLower(outputs('$Kind`_next_uri')),'&access_token=')))"
-    $same = "@and(not(empty(outputs('$Kind`_next_uri'))),equals(uriPath(outputs('$Kind`_next_uri')),uriPath(variables('CurrentWork')?['Uri'])),$nextSafe)"
+    $same = "@and(not(empty(outputs('$Kind`_next_uri'))),equals(uriScheme(outputs('$Kind`_next_uri')),'https'),equals(toLower(uriHost(outputs('$Kind`_next_uri'))),'$apiHost'),equals(uriPort(outputs('$Kind`_next_uri')),443),not(contains(outputs('$Kind`_next_uri'),'@')),not(contains(outputs('$Kind`_next_uri'),'#')),equals(uriPath(outputs('$Kind`_next_uri')),uriPath(variables('CurrentWork')?['Uri'])),$nextSafe)"
     $hasNext = [ordered]@{}
     $badNext = [ordered]@{}
     Issue $badNext ($Kind + '_bad_next') 'PagingLinkRejected' 'Paging link changed collection path. It was not followed.'
@@ -484,7 +515,7 @@ $actionDetail = [ordered]@{}
 Enqueue $actionDetail 'Queue_run_actions' @{
     Kind = 'ActionPage'; FlowId = "@variables('CurrentWork')?['FlowId']"; RunId = "@variables('CurrentWork')?['RunId']"
     FlowDisplayName = "@coalesce(variables('CurrentWork')?['FlowDisplayName'],'')"
-    Uri = "@concat('https://api.flow.microsoft.com/providers/Microsoft.ProcessSimple/environments/',uriComponent(variables('EnvironmentId')),'/flows/',uriComponent(variables('CurrentWork')?['FlowId']),'/runs/',uriComponent(variables('CurrentWork')?['RunId']),'/actions?api-version=2016-11-01')"
+    Uri = "@concat('$apiBase/providers/Microsoft.ProcessSimple/environments/',uriComponent(variables('EnvironmentId')),'/flows/',uriComponent(variables('CurrentWork')?['FlowId']),'/runs/',uriComponent(variables('CurrentWork')?['RunId']),'/actions?api-version=2016-11-01')"
 }
 Condition $details 'Need_action_details' "@contains(createArray('Errors','All'),variables('Mode'))" $actionDetail
 Enqueue $accepted 'Queue_run_expansion' @{
@@ -559,7 +590,7 @@ Enqueue $repeatSides 'Queue_operation_repetitions' @{
     FlowId = "@variables('CurrentWork')?['FlowId']"; RunId = "@variables('CurrentWork')?['RunId']"
     FlowDisplayName = "@coalesce(variables('CurrentWork')?['FlowDisplayName'],'')"
     OperationName = "@variables('CurrentWork')?['OperationName']"
-    Uri = "@concat('https://api.flow.microsoft.com/providers/Microsoft.ProcessSimple/environments/',uriComponent(variables('EnvironmentId')),'/flows/',uriComponent(variables('CurrentWork')?['FlowId']),'/runs/',uriComponent(variables('CurrentWork')?['RunId']),'/actions/',uriComponent(variables('CurrentWork')?['OperationName']),'/',createArray('repetitions','scopeRepetitions')[items('For_each_repetition_kind')],'?api-version=2016-11-01')"
+    Uri = "@concat('$apiBase/providers/Microsoft.ProcessSimple/environments/',uriComponent(variables('EnvironmentId')),'/flows/',uriComponent(variables('CurrentWork')?['FlowId']),'/runs/',uriComponent(variables('CurrentWork')?['RunId']),'/actions/',uriComponent(variables('CurrentWork')?['OperationName']),'/',createArray('repetitions','scopeRepetitions')[items('For_each_repetition_kind')],'?api-version=2016-11-01')"
 }
 Each-Index $repeats 'For_each_repetition_kind' "createArray('repetitions','scopeRepetitions')" $repeatSides
 Condition $operation 'Action_needs_repetition_probes' "@equals(variables('CurrentWork')?['OperationType'],'Action')" $repeats
@@ -610,11 +641,13 @@ Set-Value $blockedContent 'Mark_blocked_content' 'PayloadState' @{
 }
 $contentHost = "toLower(uriHost(outputs('Payload_link_uri')))"
 $contentPath = "uriPath(outputs('Payload_link_uri'))"
-$suffixChecks = @('logic.azure.com', 'api.powerplatform.com', 'flow.microsoft.com', 'blob.core.windows.net') | ForEach-Object {
+$suffixChecks = @($cloudProfile.ContentSuffixes | ForEach-Object {
     "or(equals($contentHost,'$_'),endsWith($contentHost,'.$($_)'))"
+})
+if ($cloudProfile.Name -eq 'Public') {
+    $suffixChecks += "and(endsWith($contentHost,'.environment.api.powerplatformusercontent.com'),startsWith($contentPath,'/storage/powerautomate/automations/'))"
 }
-$suffixChecks += "and(endsWith($contentHost,'.environment.api.powerplatformusercontent.com'),startsWith($contentPath,'/storage/powerautomate/automations/'))"
-$allowedContent = "@and(equals(uriScheme(outputs('Payload_link_uri')),'https'),equals(uriPort(outputs('Payload_link_uri')),443),not(contains(outputs('Payload_link_uri'),'@')),or($($suffixChecks -join ',')))"
+$allowedContent = "@and(equals(uriScheme(outputs('Payload_link_uri')),'https'),equals(uriPort(outputs('Payload_link_uri')),443),not(contains(outputs('Payload_link_uri'),'@')),not(contains(outputs('Payload_link_uri'),'#')),or($($suffixChecks -join ',')))"
 Condition $download 'Guard_anonymous_content_origin' $allowedContent $downloadAllowed $blockedContent
 $payloadCases.Download = @{ case = 'Download'; actions = $download }
 foreach ($state in @('Secured', 'NotReturned', 'MetadataUnavailable')) {
@@ -798,7 +831,7 @@ $limitIssue = [ordered]@{}
 Issue $limitIssue 'Traversal_limit_reached' 'CollectorLimitReached' 'MaxWorkItems or MaxRuns prevented complete traversal. Pending work and selected-operation payloads may be omitted; increase limits or narrow selection.'
 Condition $actions 'Any_collector_cap_reached' "@or(variables('QueueCapped'),variables('RunsCapped'),less(variables('WorkIndex'),length(variables('WorkQueue'))))" $limitIssue
 Step $actions 'Compose_report_manifest' 'Compose' ([ordered]@{
-    SchemaVersion = '1.0'; TenantId = $TenantId.ToString(); Cloud = 'Public'
+    SchemaVersion = '1.0'; TenantId = $TenantId.ToString(); Cloud = $cloudProfile.Name
     EnvironmentId = "@variables('EnvironmentId')"; CollectorFlowId = "@workflow()?['name']"; CollectorRunId = "@workflow()?['run']?['name']"
     CollectorWorkflowEntityId = "@body('Resolve_collector_identity')?['properties']?['workflowEntityId']"
     CollectorResourceId = "@body('Resolve_collector_identity')?['properties']?['resourceId']"
@@ -983,13 +1016,19 @@ $package = [pscustomobject][ordered]@{
     displayName = 'Flow Run History Collector'
     state = 'Stopped'
     targetTenantId = $TenantId.ToString()
+    targetCloud = $cloudProfile.Name
     definition = $definition
     connectionReferences = $references
     deployment = @{
         automaticDeployment = $false
         placeholdersRemain = ($WebContentsConnectionName.StartsWith('REPLACE_') -or $SharePointConnectionName.StartsWith('REPLACE_'))
-        requiredFlowResource = 'https://service.flow.microsoft.com/'
-        requiredFlowBase = 'https://api.flow.microsoft.com'
+        requiredFlowResource = $cloudProfile.Audience
+        requiredFlowBase = $apiBase
+        requiredIdentityAuthority = $cloudProfile.Authority
+        requiredIdentityEnvironment = $cloudProfile.AzEnvironment
+        contentHostSuffixes = $cloudProfile.ContentSuffixes
+        publicUserContentStorageAllowed = ($cloudProfile.Name -eq 'Public')
+        gccBestEffortOfflineOnly = ($cloudProfile.Name -eq 'GCC')
         reportSite = $site; reportFolderPath = $ReportFolderPath
         warning = 'Connections, tenant, DLP, premium licensing and existing folder must be verified before parent-owned deployment.'
     }

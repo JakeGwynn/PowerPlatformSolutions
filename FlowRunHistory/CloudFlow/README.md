@@ -4,6 +4,9 @@
 Power Automate cloud flow. It does not install anything, sign in, deploy, publish,
 run, grant permissions, create connections, or change existing connection references.
 The source generator works in Windows PowerShell 5.1 and PowerShell 7.
+**Public** remains the default. **Standard GCC (Moderate)** generation is an
+explicit best-effort option, grounded in Microsoft endpoint/connector references
+and offline fixtures; no GCC tenant deployment or live run is claimed.
 
 This is a native counterpart, not an invocation of the PowerShell reader, an Azure
 Function, custom OAuth connector, or JavaScript runtime. A single bounded FIFO
@@ -33,7 +36,8 @@ connections:
 
 1. **HTTP with Microsoft Entra ID (preauthorized)** (`shared_webcontents`):
    dedicated connection with resource `https://service.flow.microsoft.com/`
-   and base `https://api.flow.microsoft.com`. A Connected PPAPI-only connection
+   and base `https://api.flow.microsoft.com` for Public. **GCC uses the separate
+   resource/base in the table below.** A Connected PPAPI-only connection
    with base `https://api.powerplatform.com/` is not interchangeable. Never repoint
    an existing connection reference used by other flows.
 2. **SharePoint** (`shared_sharepointonline`): permission to create/read reports
@@ -47,10 +51,6 @@ retarget a connection. Another tenant needs separately authorized target-tenant
 connections. The preauthorized connector documents default-tenant and
 preauthorization restrictions; do not promise arbitrary guest/cross-tenant access
 or silently grant scopes/change clients to make it work.
-
-This generator currently targets **Public cloud only**. The PowerShell reader's
-GCC routing does not automatically establish native connector availability,
-national-cloud consent, or native GCC compatibility.
 
 ```powershell
 $p = @{
@@ -84,6 +84,97 @@ create folders, take ownership, resubmit/cancel runs, or mutate source records.
 HTTP and preauthorized HTTP are premium capabilities. Licensing, DLP, consent,
 connection sharing, Conditional Access, tenant isolation, and connector/service
 limits still apply.
+
+### Best-effort standard GCC (Moderate)
+
+Select **`-Cloud GCC` when generating the collector**. This is not a runtime
+manual input and cannot retarget an already Embedded connection or tenant.
+Public is unchanged unless you select GCC. GCC High, DoD and China are not
+implemented profiles and are rejected rather than inferred from a URL.
+
+| Requirement | Public (default) | Standard GCC |
+| --- | --- | --- |
+| Generator selection | `-Cloud Public` or omit | `-Cloud GCC` |
+| Entra authority | `https://login.microsoftonline.com` | `https://login.microsoftonline.com` |
+| Az identity context, if used by the operator | `AzureCloud` | `AzureCloud`, **not** `AzureUSGovernment` |
+| Dedicated HTTP connection Base Resource URL | `https://api.flow.microsoft.com` | `https://gov.api.flow.microsoft.us` |
+| Dedicated HTTP connection Resource URI / Flow audience | `https://service.flow.microsoft.com/` | `https://gov.service.flow.microsoft.us/` |
+
+Preserve the audience's trailing slash. The API **host**, Flow service audience,
+and Power Apps/PPAPI audience are different contracts; do not replace the GCC
+Flow resource with a token resource from an unrelated Power Apps example.
+Standard GCC uses public Entra identity even though its Flow runtime/data
+endpoints are government-hosted. This does **not** mean GCC High/DoD use that
+identity configuration.
+
+Shortest generation example, from this directory:
+
+```powershell
+.\New-FlowHistoryCollector.ps1 -Cloud GCC -TenantId $tenant `
+    -SharePointSiteUrl 'https://YOUR-TENANT.sharepoint.com/sites/Reports' `
+    -OutputPath "$env:TEMP\collector-gcc.json"
+```
+
+That package still has placeholder bindings. For a usable deployment, create or
+select a **dedicated, authorized connection in the same GCC tenant/environment**
+with the exact government resource/base above, and a GCC-tenant SharePoint
+connection authorized for the approved existing folder. Use the actual approved
+SharePoint site URL, not a guessed `.us` variant or a commercial demo site.
+Supply those existing connection identifiers to the same offline generator:
+
+```powershell
+.\New-FlowHistoryCollector.ps1 -Cloud GCC -TenantId $tenant `
+    -SharePointSiteUrl 'https://YOUR-TENANT.sharepoint.com/sites/Reports' `
+    -WebContentsConnectionName 'shared-webcontents-YOUR-GCC-FLOW-CONNECTION' `
+    -SharePointConnectionName 'shared-sharepointonl-YOUR-GCC-CONNECTION' `
+    -OutputPath "$env:TEMP\collector-gcc-bound.json"
+```
+
+Deploy the definition and **same-cloud, same-tenant Embedded bindings** in the
+intended GCC solution using its normal authorized lifecycle. The generator does
+not verify a binding's tenant/scopes, change accounts, create connections, grant
+consent, install dependencies, or deploy this package. The native test driver, if
+used, must also be in that GCC solution and reference its collector workflow ID.
+
+Microsoft's connector availability table lists **HTTP with Microsoft Entra ID
+(preauthorized) as available in GCC**. Its documentation still warns about
+default-tenant resources, limited delegated/preauthorization scopes and possible
+consent/runtime failures. Availability is not a promise that this connection's
+Flow scopes, DLP, premium licensing, network policy or tenant isolation permit
+the requested history. Public resources supported by some GCC connectors are
+not a reason to fall back to the commercial Flow API. No permission-grant or
+custom-connector workaround is performed.
+
+All self-identity, discovery, run/action/repetition and root/query-relative
+paging URLs are generated against the selected API base. Authenticated requests
+and paging admission enforce that exact HTTPS/443 host, the intended environment/
+collection and no embedded credentials/fragments. GCC never silently falls back
+to `api.flow.microsoft.com`.
+
+Anonymous GCC content downloads accept only the reader-aligned government
+families `*.logic.azure.us`, `*.api.gov.powerplatform.microsoft.us`,
+`gov.api.flow.microsoft.us` and `*.blob.core.usgovcloudapi.net` (including each
+listed base host). Public runtime/storage families and the commercial
+`*.environment.api.powerplatformusercontent.com` route are not enabled in GCC.
+No government user-content hostname is invented from a truncated/unknown domain.
+Unknown origins remain `BlockedHost`/partial coverage, not an excuse to allow all
+`*.microsoft.us`. Some government runtime suffixes are shared across services;
+a matching storage suffix is not itself proof of a tenant, cloud accreditation
+or authorization. Native HTTP redirect behavior remains runtime-controlled.
+
+The package records `targetCloud`, required API/resource/public identity settings,
+content families and `gccBestEffortOfflineOnly`; structured reports record
+`Manifest.Cloud`. IDs-only files deliberately still contain only IDs. No manual
+input, legacy connector-name normalization, actual-primary-key/SharePoint-ID
+rule, report projection, privacy limit or retention guarantee is changed by
+selecting GCC.
+
+**GCC support is best effort, documentation/fixture-validated only—not
+live-tested, platform-certified, or a government API-parity guarantee.** The
+user did not require a live GCC test. Undocumented run/action/repetition routes,
+SAS-IP restrictions, regional deployment, native save/activation or delegated
+scopes may differ. The commercial demo results below do not validate GCC, and
+the original privacy/partial-data/bounded-queue/latency limitations still apply.
 
 ### Native parameter-transport test harness
 
@@ -331,11 +422,14 @@ evidence.
 ## Security
 
 Authenticated Flow requests stay on the selected environment's HTTPS
-`api.flow.microsoft.com` read paths. Signed content requests are separate native
+`api.flow.microsoft.com` (Public) or `gov.api.flow.microsoft.us` (GCC) read paths.
+Signed content requests are separate native
 HTTP GETs with **no authentication/Authorization/cookies configured**, after
 checking HTTPS/443 and Microsoft runtime/storage suffixes. The new
-`*.environment.api.powerplatformusercontent.com` route is restricted to
-`/storage/powerautomate/automations/`. No unsupported redirect-disable option is
+`*.environment.api.powerplatformusercontent.com` route is **Public-only** and restricted to
+`/storage/powerautomate/automations/`; GCC uses only its explicit government
+families listed above. Unknown/wrong-cloud hosts, credentials, fragments and
+non-HTTPS/nonstandard-port URLs are rejected. No unsupported redirect-disable option is
 invented: native HTTP redirect behavior remains runtime-controlled.
 
 **The generator does not attach manual `secureData` to variable/control actions.**
@@ -387,6 +481,8 @@ metadata instead.
 ```powershell
 powershell.exe -NoProfile -File .\tests\Invoke-Tests.ps1
 pwsh.exe -NoProfile -File .\tests\Invoke-Tests.ps1
+powershell.exe -NoProfile -File .\tests\Invoke-Tests.ps1 -Cloud GCC
+pwsh.exe -NoProfile -File .\tests\Invoke-Tests.ps1 -Cloud GCC
 pwsh.exe -NoProfile -File .\tests\Invoke-Tests.ps1 -ResultsPath "$env:TEMP\native-collector-tests.json"
 ```
 
@@ -396,6 +492,12 @@ all generated WDL expression syntax, and fixtures that evaluate the generated
 selection/time/identity/secret/CSV/read-back expressions. The evaluator is
 deliberately test-only and does **not** emulate the native workflow runtime,
 OAuth, connector contracts, DLP, tenant permission, or service paging end-to-end.
+The same suite runs under both selected cloud profiles. GCC fixtures evaluate
+every generated route and relative paging form, public identity/government
+audience binding metadata, authenticated/content origin rejection, manifest
+labeling and cloud-independent record extraction, and compare the profiles to
+the existing reader's mapping. They do not connect to a tenant or certify
+government service behavior.
 
 The separate small connection probe was statically accepted by FlowAgent but
 actual activation found the ParseJson Secure Outputs restriction; source/tests
@@ -507,6 +609,11 @@ cleanup or tenant mutation.
 
 Sources:
 
+- [Government service description and standard GCC public Entra identity](https://learn.microsoft.com/en-us/power-automate/us-govt)
+- [Exact Flow service audience values by cloud](https://learn.microsoft.com/en-us/power-automate/oauth-authentication#audience-values)
+- [Power Automate connector availability, including GCC](https://learn.microsoft.com/en-us/connectors/connector-reference/connector-reference-powerautomate-connectors)
+- [Government API/runtime host families](https://learn.microsoft.com/en-us/power-automate/ip-address-configuration#use-the-power-automate-web-portal)
+- [Reader's aligned Public/GCC profile and auth-module references](../README.md#standard-gcc-government-community-cloud--moderate)
 - [Preauthorized HTTP connector and tenant/scope restrictions](https://learn.microsoft.com/en-us/connectors/webcontents/)
 - [SharePoint CreateFile and read-content contracts](https://learn.microsoft.com/en-us/connectors/sharepointonline/)
 - [Native workflow limits](https://learn.microsoft.com/en-us/power-automate/limits-and-config)
