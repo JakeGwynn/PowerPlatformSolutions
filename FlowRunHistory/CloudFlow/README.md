@@ -1,19 +1,31 @@
 # Native cloud-flow collector
 
-`New-FlowHistoryCollector.ps1` generates a **stopped**, solution-compatible manual
-Power Automate cloud flow. It does not install anything, sign in, deploy, publish,
-run, grant permissions, create connections, or change existing connection references.
-The source generator works in Windows PowerShell 5.1 and PowerShell 7.
-**Public** remains the default. **Standard GCC (Moderate)** generation is an
-explicit best-effort option, grounded in Microsoft endpoint/connector references
-and offline fixtures; no GCC tenant deployment or live run is claimed.
+**Install the real unmanaged solution ZIP** through **Power Platform Solutions >
+Import solution**. No PowerShell or external runtime is needed to import or run
+the flow:
+
+- [Public solution ZIP](Solutions/FlowRunHistoryCollector_Public_1_0_0_0_unmanaged.zip)
+- [Standard GCC solution ZIP](Solutions/FlowRunHistoryCollector_GCC_1_0_0_0_unmanaged.zip)
+- [Import, connection mapping and three configuration values](Solutions/README.md)
+
+Both variants are editable and **Off/Draft by default**. Map the two connections,
+set target tenant/report site/folder using the normal solution environment-variable
+interface, save and turn on the collector. **Zero explicit Secure Inputs/Outputs
+settings** are included, as requested; raw responses, payloads and signed links
+can be visible to authorized owners/co-owners in run history.
+
+The `.ps1` generator and packaging scripts are **optional maintainer/build-time
+source**, not runtime or user deployment prerequisites. Public remains the default
+source profile. Standard GCC (Moderate) is best effort, documentation/offline
+validated; its exact package passed solution staging validation, not GCC import,
+activation or runtime verification.
 
 This is a native counterpart, not an invocation of the PowerShell reader, an Azure
 Function, custom OAuth connector, or JavaScript runtime. A single bounded FIFO
 work queue keeps dynamic paging, actions, and repetitions within the native
 500-action / eight-level nesting limits.
 
-## Source and generated artifacts
+## Optional maintainer source and generated artifacts
 
 Run the examples and test commands below from this `CloudFlow` directory.
 
@@ -22,7 +34,10 @@ Run the examples and test commands below from this `CloudFlow` directory.
 | `New-FlowHistoryCollector.ps1` | Offline collector generator; returns the package object and optionally writes a new JSON file. |
 | `tests\Invoke-Tests.ps1` | Portable structural/generated-expression fixtures for PowerShell 5.1 and 7; optional `-ResultsPath` writes a test receipt. |
 | `tests\New-CollectorTestDriver.ps1` | Offline generator for a temporary native driver with literal test inputs. Not a production runtime dependency. |
-| Generated collector/driver JSON | Deployment packages with `definition` and bindings/metadata, not raw POST bodies or importable solution ZIPs. Keep bound/demo packages and reports outside the source checkout. |
+| `Solutions\*.zip` | Real portable unmanaged solution packages for ordinary user import; no PS1 prerequisite. |
+| `packaging\Build-Solutions.ps1` | Offline PAC build from sanitized genuine-export metadata and current generated definition. |
+| `packaging\Test-SolutionPackages.ps1` | ZIP hygiene and both-variant PAC unpack/pack/unpack checks. |
+| Generated collector/driver JSON | Optional authoring bundles with `definition` and bindings/metadata, not raw POST bodies or solution ZIPs. Keep bound/demo bundles and reports outside the source checkout. |
 
 Generate fresh files rather than editing or overwriting an earlier live-test
 candidate. Rebind connection names, target tenant/site and solution workflow
@@ -69,7 +84,7 @@ $p = @{
     -OutputPath "$env:TEMP\collector-bound.json"
 ```
 
-Output files must be new; no overwrite switch exists. The bundle contains
+These optional maintainer JSON output files must be new; no overwrite switch exists. The bundle contains
 `definition`, `connectionReferences`, `displayName`, `state`, and deployment
 verification metadata. It is **not** a raw Flow API POST body. An authorized
 operator deploys its definition and bindings to the intended environment/solution,
@@ -78,6 +93,11 @@ the native definition, then activates/runs it through the supported solution
 lifecycle. Solution-aware flows can reject classic `/start` with
 `CannotStartUnpublishedSolutionFlow`; use the intended solution/Dataverse publish
 and activation path, not an ownership workaround.
+
+For normal deployment use the released ZIP/import instructions instead of
+manually deploying an authoring bundle. Released packages already include the
+logical references and three solution environment-variable definitions, without
+source current values. Details and build provenance: [packaging guide](packaging/README.md).
 
 The report folder must already exist. The collector does not guess library IDs,
 create folders, take ownership, resubmit/cancel runs, or mutate source records.
@@ -107,7 +127,8 @@ Standard GCC uses public Entra identity even though its Flow runtime/data
 endpoints are government-hosted. This does **not** mean GCC High/DoD use that
 identity configuration.
 
-Shortest generation example, from this directory:
+Normal GCC installation uses the [GCC solution ZIP](Solutions/FlowRunHistoryCollector_GCC_1_0_0_0_unmanaged.zip)
+and ordinary import/configuration. Optional maintainer generation example:
 
 ```powershell
 .\New-FlowHistoryCollector.ps1 -Cloud GCC -TenantId $tenant `
@@ -115,7 +136,7 @@ Shortest generation example, from this directory:
     -OutputPath "$env:TEMP\collector-gcc.json"
 ```
 
-That package still has placeholder bindings. For a usable deployment, create or
+That authoring bundle still has placeholder bindings. For a usable deployment, create or
 select a **dedicated, authorized connection in the same GCC tenant/environment**
 with the exact government resource/base above, and a GCC-tenant SharePoint
 connection authorized for the approved existing folder. Use the actual approved
@@ -130,7 +151,7 @@ Supply those existing connection identifiers to the same offline generator:
     -OutputPath "$env:TEMP\collector-gcc-bound.json"
 ```
 
-Deploy the definition and **same-cloud, same-tenant Embedded bindings** in the
+With the real solution ZIP, map **same-cloud, same-tenant Embedded bindings** in the
 intended GCC solution using its normal authorized lifecycle. The generator does
 not verify a binding's tenant/scopes, change accounts, create connections, grant
 consent, install dependencies, or deploy this package. The native test driver, if
@@ -233,7 +254,7 @@ test-input override, or external execution dependency.
 | `FromUtc`, `ToUtc` | ISO timestamps ending in `Z`. Inclusive/exclusive **run start** boundaries. Either explicit boundary suppresses the default LastDays window; the other boundary can remain open. |
 | `ExportFormat` | `Both` (default), `CSV`, or `JSON`. |
 | `AsAdmin` | Admin discovery/history, not an authorization bypass for detailed payloads. |
-| `ExcludedFlowIds` | Additional helper/collector IDs to skip. The collector securely resolves and excludes its own runtime/resource ID and workflow alias before discovery. |
+| `ExcludedFlowIds` | Additional helper/collector IDs to skip. The collector resolves and excludes its own runtime/resource ID and workflow alias through the authenticated Flow API before discovery. |
 | `MaxWorkItems` | 1-5000, default 1000; bounds queued work including paging, expansion, payloads, and repetition requests. |
 | `MaxRuns` | 1-10000, default 100 selected runs. |
 
@@ -270,7 +291,7 @@ preselection is applied: requested names are remembered before later detail
 access/filtering. Thus a known but filtered-out run is not falsely reported missing.
 
 The runtime `workflow().name` can differ from the Flow API/Dataverse workflow
-alias. Setup securely reads **its own hosting environment's** flow by the runtime
+alias. Setup reads **its own hosting environment's** flow through the authenticated API by the runtime
 name, verifies the returned resource ID and nonempty `workflowEntityId`, then
 adds runtime name, returned name, resource ID and workflow alias to the exclusion
 set. A failed/unverifiable lookup stops initialization rather than claiming safe
@@ -432,49 +453,51 @@ families listed above. Unknown/wrong-cloud hosts, credentials, fragments and
 non-HTTPS/nonstandard-port URLs are rejected. No unsupported redirect-disable option is
 invented: native HTTP redirect behavior remains runtime-controlled.
 
-**The generator does not attach manual `secureData` to variable/control actions.**
-Actual native activation rejected SetVariable security configuration. Omitting
-unsupported protection does not mean every variable is secure.
+**No explicit Secure Inputs or Secure Outputs settings are applied anywhere in
+the current generated collector, solution ZIPs or native test driver.** This is
+the requested default, not an assertion that the data is non-sensitive. Required
+`SecureObject` authentication parameter types, OAuth, Embedded bindings and
+Authorization-independent signed-content reads are preserved.
+
 Queue entries contain IDs, sides, and authenticated metadata selectors, never raw
 operation properties, signed payload links, or full private API responses. Metadata
-is re-read into supported secured actions when needed; this costs additional read
+is re-read into action outputs when needed; this costs additional read
 calls. Repetition selectors re-read their actual collection page and select by
 name, rather than inventing an individual-repetition endpoint.
 
-Full metadata, signed URIs and raw downloaded payloads remain in secured
-Compose/HTTP/connector/data-operation outputs. A signed URI is resolved inside a
-secured Compose and passed directly to the secured anonymous HTTP action, not
-stored in a queue/variable. Trigger identity accumulation contains only whitelisted
-scalar connector/table/site/list/ID fields, not trigger bodies. Compose/Parse JSON/
-Response use **inputs only**, because those types reject explicit Secure Outputs.
-Supported connector/HTTP/data actions additionally request Secure Outputs.
+Full metadata, signed URIs and raw downloaded payloads pass through ordinary
+Compose/HTTP/connector/data-operation inputs/outputs and can be visible in run
+history. A signed URI is resolved in Compose and passed directly to anonymous
+HTTP, not stored in a queue/variable. Trigger identity accumulation still contains
+only whitelisted scalar connector/table/site/list/ID fields, not trigger bodies.
 Foreach control loops iterate **indices**, not raw objects, and are sequential.
 
-**Intended report/business data is accumulated in native variables and can be
-visible in collector run history to owners/co-owners.** Secure-step taint might
-hide some downstream values, but inherited taint is not a verified confidentiality
-boundary and is not relied on as a guarantee. Keep collector ownership, run-history
-access and connections tightly controlled in addition to the report folder ACL.
-If that exposure is unacceptable, do not use this native collector for sensitive
-payloads; use the independently controlled PowerShell reader instead. Actual
-native save/activation and run-history inspection are required: static validation
-does not establish platform confidentiality behavior.
+**Authorized owners/co-owners can see raw API responses, payloads, signed content
+links and accumulated report/business data in collector run history.** Protect
+collector ownership, run-history access, connection sharing and report folder
+ACLs. Signed links themselves grant temporary content access and must be treated
+as secrets even though the anonymous HTTP action forwards no OAuth bearer.
+Users may add supported Secure Inputs/Outputs settings in their own deployment.
+If doing so, Compose/Parse JSON/Response support inputs-only protection rather
+than explicit Secure Outputs, and variable/control actions may reject manual
+security configuration. Do not rely on unverified inherited taint.
 
 Exports whitelist metadata rather than dumping `inputsLink`, `outputsLink`,
 authentication objects, paging links, or raw service error responses. Payloads
 containing authentication, cookie/password/API-key, link or signature markers are **withheld in full**, with
 availability/reason/coverage issues, rather than pretending native expressions
-can safely implement arbitrary recursive secret redaction. Secure private trigger
+can safely implement arbitrary recursive secret redaction. Raw trigger
 payloads can still yield only verified calling IDs; specific error messages have
 their own marker guard. Business payloads can nevertheless contain confidential
 data unrelated to those markers. Protect the report folder and import untrusted
 CSV values as text to avoid spreadsheet formula execution.
 
-Secure-taint propagation can hide a final Compose even when it references only
-an authenticated action's status code. Do not bypass that protection or diagnose
-the absence of an outputs link as an authentication/host failure. Locate reports
-through their approved folder/run prefix and independently authorized storage
-metadata instead.
+This request changes only the collector's own I/O visibility defaults. It does
+not disable OAuth, change another flow's secure settings, expose protected
+historical source outputs or bypass missing-content permissions. If a source
+payload is secured/unavailable, it remains explicitly unavailable. If users later
+enable protection on the collector, taint can also hide downstream outputs;
+missing links are not proof of an authentication or host failure.
 
 ## Validation
 
@@ -487,7 +510,7 @@ pwsh.exe -NoProfile -File .\tests\Invoke-Tests.ps1 -ResultsPath "$env:TEMP\nativ
 ```
 
 Tests check action/nesting bounds, unique names/scope references, sequential
-index loops, connector/read-only boundaries, supported security configurations,
+index loops, connector/read-only boundaries, zero explicit I/O security settings,
 all generated WDL expression syntax, and fixtures that evaluate the generated
 selection/time/identity/secret/CSV/read-back expressions. The evaluator is
 deliberately test-only and does **not** emulate the native workflow runtime,
@@ -499,9 +522,13 @@ labeling and cloud-independent record extraction, and compare the profiles to
 the existing reader's mapping. They do not connect to a tenant or certify
 government service behavior.
 
-The separate small connection probe was statically accepted by FlowAgent but
-actual activation found the ParseJson Secure Outputs restriction; source/tests
-now enforce that type-specific rule. The coordinator's demo-tenant probe then
+The earlier small connection probe was statically accepted by FlowAgent but
+actual activation found a ParseJson Secure Outputs restriction. A later old
+collector activation rejected `secureData` on SetVariable. These are historical
+implementation findings, not claims that current outputs are protected. The
+current user-requested source/packages emit **no explicit `secureData` at all**;
+tests recursively check every generated action/trigger and packaged workflow
+while retaining `SecureObject` authentication. The coordinator's demo-tenant probe
 verified real preauthorized Flow reads, SharePoint create/read-back, nested action
 discovery and two actual repetitions. Those facts do not themselves establish
 full collector runtime correctness, a second tenant, or a national cloud.
@@ -510,11 +537,9 @@ Actual full-collector save validation also rejected literal array operands insid
 native JSON condition functions. The generator now uses WDL `createArray(...)`
 expression strings for enum membership; tests inspect native condition operand
 shapes separately from expression-string syntax.
-Subsequent native activation rejected `secureData` on SetVariable. The generator
-now uses an explicit supported action-type allowlist, no manual variable/control
-security configuration, selector-only work items and minimal identity accumulation.
-Tests reject direct raw response/signed-link copies into mutable variable actions.
-This is not a claim that accumulated report business data is hidden from co-owners.
+Selector-only work items and minimal identity accumulation remain. Tests reject
+direct raw response/signed-link copies into mutable queue state. This is not a
+claim that raw action inputs/outputs or business data are hidden from co-owners.
 
 Coordinated v4 live checks additionally verified genuine native child input
 transport, one-run Summary, an admin 14-day summary with three known failed runs
@@ -573,6 +598,31 @@ All native live evidence is from **one Public demo tenant**; there is no
 second-tenant or GCC native verification. These accepted cases do not remove the
 specific Dataverse organic-event, privacy, retention, API or partial-repetition
 limitations described here.
+
+### Released solution package validation and current I/O defaults
+
+The released Public/GCC unmanaged ZIPs use sanitized genuine-export metadata,
+stable portable component IDs and the latest fresh definition with three
+solution environment variables and **zero explicit Secure Inputs/Outputs
+settings**. Both exact byte streams passed independent ZIP hygiene checks and
+Dataverse **StageSolution** with no missing dependencies or validation errors;
+both also pass offline PAC unpack/pack/unpack and configuration/mapping checks.
+StageSolution is not installation, import-time connection binding, activation,
+or a GCC runtime test.
+
+The detailed native behavior results above were obtained from the earlier
+fixed-demo configuration. They are not claims of a complete target import/run
+of these new portable environment-variable packages. Source fixtures separately
+exercise the actual `metadata.schemaName` parameter bindings, configured
+tenant/site/folder paths, invalid/missing configuration failure and absence of
+explicit I/O security settings.
+
+For the latest direct request, the coordinating operator also removed only the
+requested explicit I/O security defaults/history warning on the **same existing
+demo collector**, reactivated it and verified it remained enabled with zero
+remaining explicit flags. No new run was invoked for that edit, no historical
+protected output was accessed, and other logic, connections and source flows
+were not changed. The original accepted private v6 artifact remains immutable.
 
 ### Genuine Dataverse trigger gap
 

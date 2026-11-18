@@ -9,7 +9,9 @@ Offline generator only. Does not authenticate, install dependencies, deploy,
 enable, run or change connections. See README.md for manual input, connection,
 security, coverage and native runtime limitations. Public is the default.
 Standard GCC (Moderate) generation is best-effort/documentation and offline
-fixture validated, not live-tested or platform-certified.
+fixture validated, not live-tested or platform-certified. No explicit Secure
+Inputs/Outputs settings are emitted; run history may expose raw responses,
+payloads and signed content links to authorized owners/co-owners.
 
 .PARAMETER TenantId
 Explicit tenant of the independently verified Embedded connections.
@@ -37,13 +39,19 @@ An independently verified connection authorized for the approved report folder.
 .PARAMETER OutputPath
 Optional new package file. Existing files are never overwritten.
 
+.PARAMETER UseSolutionEnvironmentVariables
+Build-time solution mode. Binds target tenant, report site and report folder to
+ordinary solution environment-variable parameters instead of fixed values.
+End users import the released solution ZIP; they do not need this generator.
+
 .EXAMPLE
 .\New-FlowHistoryCollector.ps1 -Cloud GCC -TenantId $tenant -SharePointSiteUrl 'https://YOUR-TENANT.sharepoint.com/sites/Reports' -OutputPath "$env:TEMP\collector-gcc.json"
 #>
-[CmdletBinding()]
+[CmdletBinding(DefaultParameterSetName = 'Fixed')]
 param(
-    [Parameter(Mandatory)][guid]$TenantId,
-    [Parameter(Mandatory)][uri]$SharePointSiteUrl,
+    [Parameter(Mandatory, ParameterSetName = 'Fixed')][guid]$TenantId,
+    [Parameter(Mandatory, ParameterSetName = 'Fixed')][uri]$SharePointSiteUrl,
+    [Parameter(Mandatory, ParameterSetName = 'Solution')][switch]$UseSolutionEnvironmentVariables,
     [ValidateSet('Public', 'GCC')][string]$Cloud = 'Public',
     [string]$ReportFolderPath = '/Shared Documents/FlowRunHistory',
     [string]$WebContentsConnectionName = 'REPLACE_WITH_VERIFIED_FLOW_CONNECTION',
@@ -53,10 +61,12 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-if ($TenantId -eq [guid]::Empty) { throw 'TenantId cannot be empty.' }
-if ($SharePointSiteUrl.Scheme -ne 'https' -or $SharePointSiteUrl.Port -ne 443 -or
-    $SharePointSiteUrl.UserInfo -or $SharePointSiteUrl.Query -or $SharePointSiteUrl.Fragment) {
-    throw 'SharePointSiteUrl must be an explicit HTTPS site without credentials, query, fragment or nonstandard port.'
+if (-not $UseSolutionEnvironmentVariables) {
+    if ($TenantId -eq [guid]::Empty) { throw 'TenantId cannot be empty.' }
+    if ($SharePointSiteUrl.Scheme -ne 'https' -or $SharePointSiteUrl.Port -ne 443 -or
+        $SharePointSiteUrl.UserInfo -or $SharePointSiteUrl.Query -or $SharePointSiteUrl.Fragment) {
+        throw 'SharePointSiteUrl must be an explicit HTTPS site without credentials, query, fragment or nonstandard port.'
+    }
 }
 if ($ReportFolderPath -notmatch '^/[^?#\\]+$' -or $ReportFolderPath.Contains("'") -or
     $ReportFolderPath -match '(^|/)\.\.?(/|$)' -or $ReportFolderPath.EndsWith('/')) {
@@ -83,7 +93,24 @@ else {
 }
 $apiBase = $cloudProfile.ApiBase
 $apiHost = ([uri]$apiBase).DnsSafeHost
-$site = $SharePointSiteUrl.AbsoluteUri.TrimEnd('/')
+$configuration = @(
+    @{ SchemaName = "fhr_$($cloudProfile.Name)TargetTenantId"; DisplayName = 'Target tenant ID'; Description = 'GUID of the tenant owning the mapped collector connections. This is report context, not a way to retarget OAuth.'; Required = $true; DefaultValue = '' },
+    @{ SchemaName = "fhr_$($cloudProfile.Name)ReportSiteUrl"; DisplayName = 'Report SharePoint site URL'; Description = 'Approved HTTPS SharePoint site, without a trailing slash. The mapped connection must have create/read permission.'; Required = $true; DefaultValue = '' },
+    @{ SchemaName = "fhr_$($cloudProfile.Name)ReportFolderPath"; DisplayName = 'Report folder path'; Description = 'Existing site-relative library/folder path, starting with slash and without a trailing slash.'; Required = $false; DefaultValue = $ReportFolderPath }
+)
+foreach ($setting in $configuration) { $setting.ParameterName = "$($setting.DisplayName) ($($setting.SchemaName))" }
+$tenantValue = $null; $site = $null; $folderValue = $ReportFolderPath
+$folderPrefixExpression = "'$ReportFolderPath/'"
+if ($UseSolutionEnvironmentVariables) {
+    $tenantValue = "@parameters('$($configuration[0].ParameterName)')"
+    $site = "@parameters('$($configuration[1].ParameterName)')"
+    $folderValue = "@parameters('$($configuration[2].ParameterName)')"
+    $folderPrefixExpression = "concat(parameters('$($configuration[2].ParameterName)'),'/')"
+}
+else {
+    $tenantValue = $TenantId.ToString()
+    $site = $SharePointSiteUrl.AbsoluteUri.TrimEnd('/')
+}
 $emptyObject = "@json('{}')"
 $emptyArray = "@json('[]')"
 $csvColumns = @('RowType', 'TenantId', 'EnvironmentId', 'FlowId', 'FlowDisplayName', 'RunId',
@@ -100,11 +127,6 @@ function Step {
     if ($After) { $runAfter[$After] = @('Succeeded') }
     $action = [ordered]@{ type = $Type; runAfter = $runAfter }
     if ($null -ne $Inputs) { $action.inputs = $Inputs }
-    if ($Type -in @('OpenApiConnection', 'Http', 'Compose', 'ParseJson', 'Response', 'Query', 'Select', 'Table')) {
-        $secure = @('inputs', 'outputs')
-        if ($Type -in @('Compose', 'ParseJson', 'Response')) { $secure = @('inputs') }
-        $action.runtimeConfiguration = @{ secureData = @{ properties = $secure } }
-    }
     $Map[$Name] = $action
 }
 
@@ -162,7 +184,7 @@ function Csv-Row {
     $row = [ordered]@{}
     foreach ($column in $csvColumns) { $row[$column] = '' }
     $row.RowType = $Type
-    $row.TenantId = $TenantId.ToString()
+    $row.TenantId = $tenantValue
     $row.EnvironmentId = "@variables('EnvironmentId')"
     foreach ($key in @('FlowId', 'FlowDisplayName', 'RunId', 'OperationName', 'OperationType', 'RepetitionName')) {
         $row[$key] = "@coalesce(variables('CurrentWork')?['$key'], '')"
@@ -256,6 +278,20 @@ foreach ($name in $initial.Keys) {
     Step $actions ('Initialize_' + $name) 'InitializeVariable' @{
         variables = @(@{ name = $name; type = $initial[$name].type; value = $initial[$name].value })
     }
+}
+if ($UseSolutionEnvironmentVariables) {
+    $siteParameter = $site.TrimStart('@')
+    $folderParameter = $folderValue.TrimStart('@')
+    $validConfiguration = "@and($(Guid-Test $tenantValue.TrimStart('@')),if(empty(trim($siteParameter)),false,and(equals(uriScheme($siteParameter),'https'),equals(uriPort($siteParameter),443),not(contains($siteParameter,'@')),not(contains($siteParameter,'?')),not(contains($siteParameter,'#')),not(endsWith($siteParameter,'/')))),startsWith($folderParameter,'/'),not(endsWith($folderParameter,'/')),not(contains($folderParameter,'..')),not(contains($folderParameter,'?')),not(contains($folderParameter,'#')))"
+    $invalidConfiguration = [ordered]@{}
+    Step $invalidConfiguration 'Stop_unconfigured_solution' 'Terminate' @{
+        runStatus = 'Failed'
+        runError = @{
+            code = 'ConfigureSolutionEnvironmentVariables'
+            message = 'Set the solution Target tenant ID, Report SharePoint site URL and existing Report folder path before turning on/running the collector.'
+        }
+    }
+    Condition $actions 'Validate_solution_configuration' $validConfiguration ([ordered]@{}) $invalidConfiguration
 }
 Step $actions 'Validate_manual_inputs' 'If' $null
 $actions.Validate_manual_inputs.expression = @{ and = @(
@@ -489,7 +525,7 @@ Step $runGood 'Run_matches_filters' 'Compose' (Run-FilterExpression "outputs('Cu
 $takeRun = [ordered]@{}
 $accepted = [ordered]@{}
 $runRow = Metadata "outputs('Current_run_properties')"
-$runRow.TenantId = $TenantId.ToString()
+$runRow.TenantId = $tenantValue
 $runRow.EnvironmentId = "@variables('EnvironmentId')"
 $runRow.FlowId = "@variables('CurrentWork')?['FlowId']"
 $runRow.FlowDisplayName = "@coalesce(variables('CurrentWork')?['FlowDisplayName'],'')"
@@ -831,7 +867,7 @@ $limitIssue = [ordered]@{}
 Issue $limitIssue 'Traversal_limit_reached' 'CollectorLimitReached' 'MaxWorkItems or MaxRuns prevented complete traversal. Pending work and selected-operation payloads may be omitted; increase limits or narrow selection.'
 Condition $actions 'Any_collector_cap_reached' "@or(variables('QueueCapped'),variables('RunsCapped'),less(variables('WorkIndex'),length(variables('WorkQueue'))))" $limitIssue
 Step $actions 'Compose_report_manifest' 'Compose' ([ordered]@{
-    SchemaVersion = '1.0'; TenantId = $TenantId.ToString(); Cloud = $cloudProfile.Name
+    SchemaVersion = '1.0'; TenantId = $tenantValue; Cloud = $cloudProfile.Name
     EnvironmentId = "@variables('EnvironmentId')"; CollectorFlowId = "@workflow()?['name']"; CollectorRunId = "@workflow()?['run']?['name']"
     CollectorWorkflowEntityId = "@body('Resolve_collector_identity')?['properties']?['workflowEntityId']"
     CollectorResourceId = "@body('Resolve_collector_identity')?['properties']?['resourceId']"
@@ -844,11 +880,11 @@ Step $actions 'Compose_report_manifest' 'Compose' ([ordered]@{
     QueueCapped = "@variables('QueueCapped')"; RunsCapped = "@variables('RunsCapped')"
     SelectedRunCount = "@length(variables('Runs'))"; UnmatchedRunIds = "@body('Find_missing_requested_runs')"
     ExcludedFlowIds = "@variables('ExcludedFlowIds')"
-    RunHistoryLimitation = 'Native variable actions cannot be manually secured. Accumulated intended report/business data may be visible to collector owners/co-owners; inherited taint is not a verified confidentiality boundary.'
+    RunHistoryLimitation = 'No explicit Secure Inputs/Outputs settings are applied. Raw responses, payloads and signed links may be visible to authorized collector owners/co-owners in run history. Protect collector access or add supported settings yourself; OAuth and report withholding remain enabled.'
     Limits = @('Service retention/permissions/secure data apply.', 'Only the runtime action collection is used for action discovery.',
         'Scalar/unsupported repetition routes are explicit coverage issues.', 'No Dataverse metadata connector: canonical IDs or explicit actual-key map only.',
         'Credential/link-marker payloads are conservatively withheld in full.', 'HTTP redirect behavior is runtime-controlled; no blocked-redirect claim.',
-        'Variable/control actions cannot be manually secured; report data may be visible to collector owners/co-owners in run history.',
+        'Secure Inputs/Outputs is not applied; raw responses, payloads and signed links may be visible to authorized collector owners/co-owners.',
         'SharePoint create uses unique run/GUID names, not an atomic create-if-absent guarantee.')
 })
 Step $actions 'Compose_structured_report' 'Compose' ([ordered]@{
@@ -900,14 +936,14 @@ Step $csv 'CSV_export_text' 'Compose' "@if(variables('IdOnly'),body('Create_mini
 Step $csv 'Write_CSV_report' 'OpenApiConnection' @{
     host = @{ apiId = '/providers/Microsoft.PowerApps/apis/shared_sharepointonline'; connectionName = 'shared_sharepointonline'; operationId = 'CreateFile' }
     parameters = @{
-        dataset = $site; folderPath = $ReportFolderPath
+        dataset = $site; folderPath = $folderValue
         name = "@concat(outputs('Compose_unique_report_prefix'),'.csv')"; body = "@outputs('CSV_export_text')"
     }
 }
 Step $csv 'Read_CSV_report_back' 'OpenApiConnection' @{
     host = @{ apiId = '/providers/Microsoft.PowerApps/apis/shared_sharepointonline'; connectionName = 'shared_sharepointonline'; operationId = 'GetFileContentByPath' }
     parameters = @{
-        dataset = $site; path = "@concat('$ReportFolderPath/',outputs('Compose_unique_report_prefix'),'.csv')"; inferContentType = $false
+        dataset = $site; path = "@concat($folderPrefixExpression,outputs('Compose_unique_report_prefix'),'.csv')"; inferContentType = $false
     }
 }
 $csvMismatch = [ordered]@{}
@@ -921,14 +957,14 @@ Step $json 'JSON_export_text' 'Compose' "@if(variables('IdOnly'),string(variable
 Step $json 'Write_JSON_report' 'OpenApiConnection' @{
     host = @{ apiId = '/providers/Microsoft.PowerApps/apis/shared_sharepointonline'; connectionName = 'shared_sharepointonline'; operationId = 'CreateFile' }
     parameters = @{
-        dataset = $site; folderPath = $ReportFolderPath
+        dataset = $site; folderPath = $folderValue
         name = "@concat(outputs('Compose_unique_report_prefix'),'.json')"; body = "@outputs('JSON_export_text')"
     }
 }
 Step $json 'Read_JSON_report_back' 'OpenApiConnection' @{
     host = @{ apiId = '/providers/Microsoft.PowerApps/apis/shared_sharepointonline'; connectionName = 'shared_sharepointonline'; operationId = 'GetFileContentByPath' }
     parameters = @{
-        dataset = $site; path = "@concat('$ReportFolderPath/',outputs('Compose_unique_report_prefix'),'.json')"; inferContentType = $false
+        dataset = $site; path = "@concat($folderPrefixExpression,outputs('Compose_unique_report_prefix'),'.json')"; inferContentType = $false
     }
 }
 $jsonMismatch = [ordered]@{}
@@ -938,7 +974,7 @@ Step $jsonMismatch 'Stop_JSON_readback_mismatch' 'Terminate' @{
 Condition $json 'JSON_bytes_match' "@not(equals(body('Read_JSON_report_back')?['`$content'],base64(outputs('JSON_export_text'))))" $jsonMismatch
 Condition $actions 'Export_JSON_requested' "@contains(createArray('Both','JSON'),variables('ExportFormat'))" $json
 Step $actions 'Compose_completion_receipt' 'Compose' @{
-    Manifest = "@outputs('Compose_report_manifest')"; ReportSite = $site; ReportFolder = $ReportFolderPath
+    Manifest = "@outputs('Compose_report_manifest')"; ReportSite = $site; ReportFolder = $folderValue
     ReportPrefix = "@outputs('Compose_unique_report_prefix')"; ExportFormat = "@variables('ExportFormat')"
 }
 Step $actions 'Respond_to_parent' 'Response' @{
@@ -947,7 +983,7 @@ Step $actions 'Respond_to_parent' 'Response' @{
         collectorrunid = "@workflow()?['run']?['name']"
         collectorruntimeid = "@workflow()?['name']"
         reportsite = $site
-        reportfolder = $ReportFolderPath
+        reportfolder = $folderValue
         reportprefix = "@outputs('Compose_unique_report_prefix')"
         mode = "@variables('Mode')"
         coverage = "@if(empty(variables('Issues')),'AvailableServiceData','Partial')"
@@ -1003,6 +1039,15 @@ $definition = [ordered]@{
     actions = $actions
     outputs = @{}
 }
+if ($UseSolutionEnvironmentVariables) {
+    foreach ($setting in $configuration) {
+        $definition.parameters[$setting.ParameterName] = @{
+            type = 'String'
+            defaultValue = $setting.DefaultValue
+            metadata = @{ schemaName = $setting.SchemaName; description = $setting.Description }
+        }
+    }
+}
 $references = [ordered]@{}
 foreach ($connector in @('shared_webcontents', 'shared_sharepointonline')) {
     $connection = $WebContentsConnectionName
@@ -1015,7 +1060,7 @@ foreach ($connector in @('shared_webcontents', 'shared_sharepointonline')) {
 $package = [pscustomobject][ordered]@{
     displayName = 'Flow Run History Collector'
     state = 'Stopped'
-    targetTenantId = $TenantId.ToString()
+    targetTenantId = $(if ($UseSolutionEnvironmentVariables) { $null } else { $TenantId.ToString() })
     targetCloud = $cloudProfile.Name
     definition = $definition
     connectionReferences = $references
@@ -1029,7 +1074,10 @@ $package = [pscustomobject][ordered]@{
         contentHostSuffixes = $cloudProfile.ContentSuffixes
         publicUserContentStorageAllowed = ($cloudProfile.Name -eq 'Public')
         gccBestEffortOfflineOnly = ($cloudProfile.Name -eq 'GCC')
-        reportSite = $site; reportFolderPath = $ReportFolderPath
+        reportSite = $(if ($UseSolutionEnvironmentVariables) { $null } else { $site })
+        reportFolderPath = $ReportFolderPath
+        configurationMode = $(if ($UseSolutionEnvironmentVariables) { 'SolutionEnvironmentVariables' } else { 'Fixed' })
+        environmentVariables = $(if ($UseSolutionEnvironmentVariables) { $configuration } else { @() })
         warning = 'Connections, tenant, DLP, premium licensing and existing folder must be verified before parent-owned deployment.'
     }
 }

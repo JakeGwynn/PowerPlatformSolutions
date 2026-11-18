@@ -8,11 +8,15 @@ and **GCC (Moderate)** routing. GCC settings are grounded in Microsoft reference
 and offline tests; no live GCC tenant was available.
 
 For the **native Power Automate counterpart**, see the
-[cloud-flow collector guide](CloudFlow/README.md). It covers the portable
-generator, native test driver, offline tests, JSON/CSV report packages, and the
-Public/default plus **best-effort standard GCC** generation option (GCC is not
-live-tested). Premium-connector, run-history privacy and observed runtime limits apply.
+[importable Public/GCC unmanaged solution ZIPs](CloudFlow/Solutions/README.md)
+and [cloud-flow collector guide](CloudFlow/README.md). No PowerShell is required
+to import/run the native flow. The guide covers optional maintainer source,
+native testing and JSON/CSV reports, with Public as the default and standard GCC
+as **best effort** (not live-tested). Premium-connector, run-history privacy and
+observed runtime limits apply.
 No performance equivalence to the PowerShell reader is claimed.
+The native packages have no explicit Secure Inputs/Outputs settings; raw payloads
+and signed links can be visible to authorized collector owners/co-owners in history.
 
 ## Quick start
 

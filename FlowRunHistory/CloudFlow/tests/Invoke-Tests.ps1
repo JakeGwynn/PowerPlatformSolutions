@@ -34,19 +34,19 @@ function Test-Case {
 }
 
 function Collect-Actions {
-    param($Map, [int]$Depth = 1)
+    param($Map, [int]$Depth = 1, [hashtable]$Target = $actions)
     $script:maxDepth = [Math]::Max($script:maxDepth, $Depth)
     foreach ($entry in $Map.GetEnumerator()) {
-        Assert (-not $actions.ContainsKey($entry.Key)) "Duplicate global action name: $($entry.Key)"
-        $actions[$entry.Key] = $entry.Value
+        Assert (-not $Target.ContainsKey($entry.Key)) "Duplicate global action name: $($entry.Key)"
+        $Target[$entry.Key] = $entry.Value
         $action = $entry.Value
         foreach ($previous in $action.runAfter.Keys) {
             Assert ($Map.Contains($previous)) "runAfter references an action outside its sibling scope: $previous"
         }
-        if ($action.Contains('actions')) { Collect-Actions $action.actions ($Depth + 1) }
-        if ($action.Contains('else')) { Collect-Actions $action.else.actions ($Depth + 1) }
-        if ($action.Contains('cases')) { foreach ($case in $action.cases.Values) { Collect-Actions $case.actions ($Depth + 1) } }
-        if ($action.Contains('default')) { Collect-Actions $action.default.actions ($Depth + 1) }
+        if ($action.Contains('actions')) { Collect-Actions $action.actions ($Depth + 1) $Target }
+        if ($action.Contains('else')) { Collect-Actions $action.else.actions ($Depth + 1) $Target }
+        if ($action.Contains('cases')) { foreach ($case in $action.cases.Values) { Collect-Actions $case.actions ($Depth + 1) $Target } }
+        if ($action.Contains('default')) { Collect-Actions $action.default.actions ($Depth + 1) $Target }
     }
 }
 
@@ -57,6 +57,17 @@ function Collect-Expressions {
     }
     elseif ($Value -is [Collections.IDictionary]) { foreach ($item in $Value.Values) { Collect-Expressions $item } }
     elseif ($Value -is [Collections.IEnumerable]) { foreach ($item in $Value) { Collect-Expressions $item } }
+}
+
+function Assert-NoExplicitSecureData {
+    param($Value)
+    if ($Value -is [Collections.IDictionary]) {
+        Assert (-not $Value.Contains('secureData')) 'Explicit secureData remains in the generated action/trigger tree.'
+        foreach ($item in $Value.Values) { Assert-NoExplicitSecureData $item }
+    }
+    elseif ($Value -is [Collections.IEnumerable] -and $Value -isnot [string]) {
+        foreach ($item in $Value) { Assert-NoExplicitSecureData $item }
+    }
 }
 
 function Check-NativeCondition {
@@ -164,6 +175,7 @@ function Eval-Wdl {
     foreach ($argument in $Node.Arguments) { $args.Add((Eval-Wdl $argument $Context)) }
     switch ($name) {
         'variables' { return Wdl-Index $Context.Variables $args[0] }
+        'parameters' { return Wdl-Index $Context.Parameters $args[0] }
         'outputs' { return Wdl-Index $Context.Outputs $args[0] }
         'body' { return Wdl-Index $Context.Bodies $args[0] }
         'triggerbody' { return ,$Context.Trigger }
@@ -232,7 +244,7 @@ function Eval-Wdl {
 
 function Context {
     return @{
-        Variables = @{}; Outputs = @{}; Bodies = @{}; Trigger = @{}; Items = @{}; Item = $null
+        Variables = @{}; Outputs = @{}; Bodies = @{}; Trigger = @{}; Items = @{}; Item = $null; Parameters = @{}
         Workflow = @{ name = '33333333-3333-4333-8333-333333333333'; run = @{ name = 'fixture-run' }; tags = @{ environmentName = 'fixture-environment' } }
     }
 }
@@ -262,22 +274,18 @@ Test-Case 'Definition stays within 500 actions/eight levels and uses a bounded f
     Assert ($actions.Process_bounded_work_queue.limit.count -eq 5000) 'Until limit is not explicit.'
     Assert ($actions.Traversal_limit_reached.inputs.value.State -eq 'CollectorLimitReached') 'Cap exhaustion lacks a visible coverage issue.'
 }
-Test-Case 'Native Button, required auth declarations, Embedded placeholders and type-specific security' {
+Test-Case 'Native Button and Embedded authentication remain while every explicit secure-I/O setting is absent' {
     Assert ($package.state -eq 'Stopped' -and $package.deployment.placeholdersRemain) 'Generator must not deploy or infer bindings.'
     Assert ($package.definition.triggers.manual.kind -eq 'Button') 'Wrong trigger.'
     Assert ($package.definition.parameters.'$authentication'.type -eq 'SecureObject') 'Missing authentication parameter.'
     foreach ($reference in $package.connectionReferences.Values) { Assert ($reference.source -eq 'Embedded') 'Invoker binding forbidden.' }
     foreach ($action in $actions.Values) {
-        $supportsSecureData = $action.type -in @('OpenApiConnection', 'Http', 'Compose', 'ParseJson', 'Response', 'Query', 'Select', 'Table')
-        if ($supportsSecureData) { Assert ('inputs' -in $action.runtimeConfiguration.secureData.properties) 'Supported data-bearing action lacks Secure Inputs.' }
-        else {
-            Assert (-not $action.Contains('runtimeConfiguration') -or -not $action.runtimeConfiguration.Contains('secureData')) "Unsupported secureData on $($action.type)."
-        }
-        if ($action.type -in @('Compose', 'ParseJson', 'Response')) { Assert ('outputs' -notin $action.runtimeConfiguration.secureData.properties) 'Unsupported Secure Outputs on an inputs-only type.' }
         if ($action.type -eq 'Foreach') {
             Assert ($action.runtimeConfiguration.concurrency.repetitions -eq 1) 'Shared accumulation is not sequential.'
             Assert ($action.foreach.StartsWith('@range(')) 'Foreach must expose indices, not raw payloads, to control history.'
         }
+        Assert-NoExplicitSecureData $package.definition
+        Assert ($package.definition.parameters.'$authentication'.type -ceq 'SecureObject') 'SecureObject is a required authentication type, not a removable I/O setting.'
     }
 }
 Test-Case 'Unsecurable variables queue metadata selectors only, never raw metadata or signed-link state' {
@@ -295,11 +303,12 @@ Test-Case 'Unsecurable variables queue metadata selectors only, never raw metada
             }
         }
     }
-    Assert ($actions.Read_signed_payload_anonymously.inputs.uri -eq "@outputs('Payload_link_uri')") 'Signed URI should be resolved directly between secured actions.'
+    Assert ($actions.Read_signed_payload_anonymously.inputs.uri -eq "@outputs('Payload_link_uri')") 'Signed URI should be resolved directly, not placed in variable state.'
     Assert ($actions.Add_payload_record.inputs.value.Content -eq "@outputs('Safe_payload_for_report')") 'Business report accumulation bypasses the selected safe projection.'
     Assert ($actions.New_trigger_data.inputs -match "outputs\('Safe_trigger_fields'\)") 'Record context stores raw source payloads instead of whitelisted scalar identity fields.'
     Assert (-not ($package.definition.actions.Initialize_ResponseState.inputs.variables[0].value.Contains('Body'))) 'Response variable stores a raw response body.'
-    Assert ($actions.Compose_report_manifest.inputs.RunHistoryLimitation -match 'cannot be manually secured') 'Native run-history/co-owner limitation is hidden.'
+    Assert ($actions.Compose_report_manifest.inputs.RunHistoryLimitation -match 'No explicit Secure Inputs/Outputs' -and
+        $actions.Compose_report_manifest.inputs.RunHistoryLimitation -match 'signed links') 'Explicitly unsecured run-history/co-owner limitation is hidden.'
 }
 Test-Case 'Only Flow GET and approved SharePoint file actions are connector operations' {
     foreach ($action in $actions.Values) {
@@ -527,6 +536,7 @@ Test-Case 'PowerApp completion and native literal-body driver do not depend on m
     Assert ($driver.state -eq 'Stopped' -and $driver.definition.triggers.manual.kind -eq 'Button') 'Driver is not a stopped, no-argument native manual flow.'
     Assert ($driver.definition.triggers.manual.inputs.schema.properties.Count -eq 0) 'Driver still relies on an externally transmitted manual body.'
     $call = $driver.definition.actions.Call_collector
+    Assert-NoExplicitSecureData $driver.definition
     Assert ($call.type -eq 'Workflow') 'Driver is not native Run a Child Flow.'
     Assert ($call.inputs.host.workflowReferenceName -eq '77777777-7777-4777-8777-777777777777') 'Driver did not use the literal verified workflow GUID.'
     Assert ($call.inputs.body.Mode -eq 'Errors' -and $call.inputs.body.RunIds -eq 'fixture-run') 'Parent-supplied literal body changed.'
@@ -852,6 +862,53 @@ Test-Case 'Public is the unchanged default choice and unimplemented sovereign cl
         catch [Management.Automation.ParameterBindingException] { $caught = $true }
         Assert $caught 'Unimplemented cloud silently fell back to Public or GCC.'
     }
+}
+
+Test-Case 'Solution configuration uses ordinary parameter schema bindings and no fixed tenant/site or secure-I/O flags' {
+    $solutionPackage = & $generator -Cloud $Cloud -UseSolutionEnvironmentVariables
+    Assert ($solutionPackage.deployment.configurationMode -ceq 'SolutionEnvironmentVariables' -and
+        $null -eq $solutionPackage.targetTenantId -and $null -eq $solutionPackage.deployment.reportSite) 'Solution mode retains a fixed target.'
+    $settings = $solutionPackage.deployment.environmentVariables
+    Assert ($settings.Count -eq 3) 'Expected tenant/site/folder definitions.'
+    $configured = @{}
+    Collect-Actions $solutionPackage.definition.actions 1 $configured
+    Assert ($configured.Count -le 500 -and $maxDepth -le 8) 'Solution configuration exceeded native limits.'
+    Assert-NoExplicitSecureData $solutionPackage.definition
+    foreach ($setting in $settings) {
+        $binding = $solutionPackage.definition.parameters[$setting.ParameterName]
+        Assert ($binding.type -ceq 'String' -and $binding.metadata.schemaName -ceq $setting.SchemaName) 'Environment-variable parameter metadata is unsupported/inconsistent.'
+        if ($setting.Required) { Assert ($binding.defaultValue -ceq '') 'Required tenant/site has a bound source value.' }
+    }
+    $first = $expressions.Count
+    Collect-Expressions $solutionPackage.definition
+    for ($index = $first; $index -lt $expressions.Count; $index++) { $null = Parse-Wdl $expressions[$index]; Assert ($expressions[$index].Length -le 8192) 'Configured expression too long.' }
+    $c = Context
+    foreach ($setting in $settings) { $c.Parameters[$setting.ParameterName] = $setting.DefaultValue }
+    Assert (-not [bool](Evaluate $configured.Validate_solution_configuration.expression.equals[0] $c)) 'Unconfigured solution can run as if valid.'
+    $c.Parameters[$settings[0].ParameterName] = '11111111-1111-4111-8111-111111111111'
+    $c.Parameters[$settings[1].ParameterName] = 'https://contoso.sharepoint.com/sites/Reports'
+    Assert ([bool](Evaluate $configured.Validate_solution_configuration.expression.equals[0] $c)) 'Ordinary valid import values rejected.'
+    Assert ((Evaluate $configured.Compose_report_manifest.inputs.TenantId $c) -ceq $c.Parameters[$settings[0].ParameterName]) 'Manifest ignored the imported tenant setting.'
+    Assert ((Evaluate $configured.Write_JSON_report.inputs.parameters.dataset $c) -ceq $c.Parameters[$settings[1].ParameterName]) 'SharePoint action ignored the imported site setting.'
+    $c.Outputs.Compose_unique_report_prefix = 'flow-history-fixture'
+    Assert ((Evaluate $configured.Read_JSON_report_back.inputs.parameters.path $c) -ceq '/Shared Documents/FlowRunHistory/flow-history-fixture.json') 'Read-back path ignored the imported folder setting.'
+    $c.Parameters[$settings[0].ParameterName] = '00000000-0000-0000-0000-000000000000'
+    Assert (-not [bool](Evaluate $configured.Validate_solution_configuration.expression.equals[0] $c)) 'Solution accepted an empty tenant sentinel.'
+    $valid = @{} + $c.Parameters
+    $valid[$settings[0].ParameterName] = '11111111-1111-4111-8111-111111111111'
+    foreach ($case in @(
+        @{ Index = 0; Value = '' }, @{ Index = 0; Value = 'not-a-guid' },
+        @{ Index = 1; Value = '' }, @{ Index = 1; Value = 'http://contoso.sharepoint.com/sites/Reports' },
+        @{ Index = 1; Value = 'https://user:password@contoso.sharepoint.com/sites/Reports' },
+        @{ Index = 1; Value = 'https://contoso.sharepoint.com/sites/Reports?sig=secret' },
+        @{ Index = 2; Value = '' }, @{ Index = 2; Value = 'relative/folder' },
+        @{ Index = 2; Value = '/Shared Documents/../Other' }, @{ Index = 2; Value = '/Shared Documents/Reports/' }
+    )) {
+        $c.Parameters = @{} + $valid
+        $c.Parameters[$settings[$case.Index].ParameterName] = $case.Value
+        Assert (-not [bool](Evaluate $configured.Validate_solution_configuration.expression.equals[0] $c)) 'Invalid required solution configuration can produce an apparently valid run.'
+    }
+    Assert ($configured.Stop_unconfigured_solution.inputs.runStatus -ceq 'Failed') 'Missing solution configuration is not explicit.'
 }
 
 $failed = @($results | Where-Object { -not $_.Passed })
