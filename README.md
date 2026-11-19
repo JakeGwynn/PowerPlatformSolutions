@@ -3,10 +3,10 @@
 - [Developer premium app inventory](DeveloperPremiumAppInventory/README.md): read-only,
   tenant-wide PowerShell inventory of premium-capability apps in unmanaged Developer
   environments, with resumable paging, throttling protection, and explicit coverage/review reports.
-- [Flow run history](FlowRunHistory/README.md): PowerShell 5.1/7 cloud-flow history,
-  trigger/action details, error messages, Dataverse/SharePoint calling record IDs,
-  direct JSON/CSV exports, automatic auth-dependency installation, and explicit
-  Public/GCC routing (GCC is documentation/fixture-tested, not live-tested).
+- [Flow run history](FlowRunHistory/README.md): standalone PowerShell 5.1/7 reader
+  and importable Public/GCC cloud-flow solutions for history, action errors,
+  Dataverse/SharePoint calling record IDs, and JSON/CSV reports.
+  GCC is best effort, not live-tested.
 
 
 Copyright 2025 Jake Gwynn
